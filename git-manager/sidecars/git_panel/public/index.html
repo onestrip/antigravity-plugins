@@ -59,10 +59,10 @@
     </header>
 
     <!-- 空状态 / 初始化引导 -->
-    <main id="empty-state" class="empty-state hidden">
+    <main id="empty-state" class="empty-state">
       <div class="empty-card">
-        <h2 id="empty-title">正在连接工作区…</h2>
-        <p id="empty-desc">等待 Antigravity 传入当前对话的工作区目录。</p>
+        <h2 id="empty-title">正在加载工作区与仓库状态…</h2>
+        <p id="empty-desc">正在读取当前 Antigravity 对话的工作区目录。</p>
         <div id="empty-actions" class="empty-actions hidden">
           <button id="btn-init-repo" class="btn btn-primary">初始化 Git 仓库 (git init)</button>
         </div>
@@ -241,6 +241,6 @@
   <!-- Toast 提示 -->
   <div id="toast-container" class="toast-container"></div>
 
-  <script type="module" src="/app.js"></script>
+  <script src="/app.js"></script>
 </body>
 </html>

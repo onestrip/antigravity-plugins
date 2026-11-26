@@ -47,29 +47,33 @@ html, body {
 
 /* 顶部栏 */
 .topbar {
-  padding: 10px 12px 8px;
+  padding: 8px 10px;
   border-bottom: 1px solid var(--gm-border);
   background: var(--gm-bg);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 7px;
   flex-shrink: 0;
+  min-width: 0;
 }
 
 .topbar-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 6px;
+  min-width: 0;
 }
 
 .repo-picker-wrap {
   flex: 1;
   min-width: 0;
+  overflow: hidden;
 }
 
 .repo-select {
   width: 100%;
+  min-width: 0;
   padding: 4px 8px;
   border-radius: 6px;
   border: 1px solid var(--gm-border);
@@ -80,7 +84,7 @@ html, body {
 }
 
 .repo-single-label {
-  display: inline-block;
+  display: block;
   font-weight: 600;
   font-size: 13px;
   color: var(--gm-fg);
@@ -94,6 +98,7 @@ html, body {
   display: flex;
   align-items: center;
   gap: 4px;
+  flex-shrink: 0;
 }
 
 .icon-btn {
@@ -121,6 +126,7 @@ html, body {
   justify-content: space-between;
   flex-wrap: wrap;
   gap: 6px;
+  min-width: 0;
 }
 
 .branch-pill {
@@ -135,7 +141,8 @@ html, body {
   font-size: 12px;
   font-weight: 500;
   cursor: pointer;
-  max-width: 180px;
+  max-width: 100%;
+  min-width: 0;
 }
 
 .branch-pill:hover {
@@ -168,7 +175,9 @@ html, body {
 .sync-buttons {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 4px;
+  min-width: 0;
 }
 
 /* 按钮 */

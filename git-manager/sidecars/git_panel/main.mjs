@@ -39,6 +39,8 @@ import {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = join(__dirname, 'public');
+const METADATA_CACHE_TTL_MS = 5000;
+const metadataWorkspaceCache = new Map(); // conversationId -> { uris, ts }
 
 function serveStatic(filename, contentType) {
   return () => {
@@ -47,10 +49,69 @@ function serveStatic(filename, contentType) {
   };
 }
 
+function extractWorkspaceUrisFromMetadata(metaResult) {
+  const metaEvent =
+    metaResult?.response?.conversationMetadata ||
+    metaResult?.response?.conversation_metadata;
+  const meta = metaEvent?.metadata;
+  if (!meta) return [];
+
+  const uris = [];
+  const rawList = meta.workspaceUris || meta.workspace_uris;
+  if (Array.isArray(rawList)) {
+    for (const u of rawList) {
+      if (typeof u === 'string' && u.trim()) uris.push(u.trim());
+    }
+  }
+
+  const workspaces = meta.workspaces;
+  if (Array.isArray(workspaces)) {
+    for (const ws of workspaces) {
+      const folderUri =
+        ws?.workspaceFolderAbsoluteUri ||
+        ws?.workspace_folder_absolute_uri ||
+        ws?.gitRootAbsoluteUri ||
+        ws?.git_root_absolute_uri;
+      if (typeof folderUri === 'string' && folderUri.trim()) {
+        uris.push(folderUri.trim());
+      }
+    }
+  }
+
+  return Array.from(new Set(uris));
+}
+
+function resolveWorkspaceUris(app, data = {}) {
+  if (Array.isArray(data.workspaceUris) && data.workspaceUris.length > 0) {
+    return data.workspaceUris;
+  }
+
+  const convId =
+    (typeof data.conversationId === 'string' && data.conversationId.trim()) ||
+    app.config.conversationId ||
+    '';
+  if (!convId) return [];
+
+  const cached = metadataWorkspaceCache.get(convId);
+  if (cached && Date.now() - cached.ts < METADATA_CACHE_TTL_MS) {
+    return cached.uris;
+  }
+
+  try {
+    const metaResult = app.getConversationMetadata(convId);
+    const uris = extractWorkspaceUrisFromMetadata(metaResult);
+    metadataWorkspaceCache.set(convId, { uris, ts: Date.now() });
+    return uris;
+  } catch {
+    return [];
+  }
+}
+
 function registerRepoApi(app, route, handler, { allowNonGit = false } = {}) {
   app.api(route, async (data) => {
     try {
-      const repoPath = await assertAllowedRepo(data.repoPath, data.workspaceUris, { allowNonGit });
+      const workspaceUris = resolveWorkspaceUris(app, data);
+      const repoPath = await assertAllowedRepo(data.repoPath, workspaceUris, { allowNonGit });
       const result = await handler(repoPath, data);
       return {
         ok: true,
@@ -76,8 +137,9 @@ app.page('/app.js', serveStatic('app.js', 'application/javascript; charset=utf-8
 // 全部 API 使用 POST，确保强制经过 sidecar_sdk 的 X-Sidecar-Token 校验
 app.api('/api/repos', async (data) => {
   try {
-    const repos = await discoverRepos(data.workspaceUris);
-    return { ok: true, data: { repos } };
+    const workspaceUris = resolveWorkspaceUris(app, data);
+    const repos = await discoverRepos(workspaceUris);
+    return { ok: true, data: { repos, workspaceUris } };
   } catch (err) {
     return { ok: false, error: err?.message || String(err) };
   }
