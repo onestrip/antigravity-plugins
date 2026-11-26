@@ -4,6 +4,16 @@
 (() => {
   'use strict';
 
+  const SETTINGS_STORAGE_KEY = 'agy_git_manager_settings_v1';
+  const AUTO_FETCH_INTERVAL_MS = 90_000;
+
+  const SVG_ICONS = {
+    open: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 3.5H3.8A1.3 1.3 0 0 0 2.5 4.8v7.4a1.3 1.3 0 0 0 1.3 1.3h7.4a1.3 1.3 0 0 0 1.3-1.3V9.5"/><path d="M9.5 2.5h4v4M8 8l5.5-5.5"/></svg>',
+    plus: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M8 3.2v9.6M3.2 8h9.6"/></svg>',
+    minus: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M3.2 8h9.6"/></svg>',
+    discard: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5.5 4.5 2.5 7l3 2.5"/><path d="M2.8 7H9a3.5 3.5 0 1 1 0 7H6.5"/></svg>',
+  };
+
   const state = {
     workspaceUris: [],
     repos: [],
@@ -16,8 +26,17 @@
     expandedDiffs: new Map(), // key -> { loading, data, error }
     expandedCommits: new Map(), // hash -> { loading, data, error }
     logs: [],
+    hasUnreadError: false,
     busy: false,
+    lastFetchAt: 0,
+    autoFetchInFlight: false,
     pollingTimer: null,
+    settings: {
+      commitLang: 'zh',
+      pullRebase: true,
+      autoFetch: true,
+      forceWithLease: false,
+    },
   };
 
   const $ = (id) => document.getElementById(id);
@@ -41,6 +60,7 @@
       $('empty-desc').textContent = detail;
       $('empty-actions').classList.add('hidden');
     }
+    state.hasUnreadError = true;
     state.logs.unshift({
       time: new Date().toLocaleTimeString(),
       command: 'frontend-runtime',
@@ -84,10 +104,103 @@
     }, 3600);
   }
 
+  function readLocalSettings() {
+    try {
+      const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  function writeLocalSettings(settings) {
+    try {
+      localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+    } catch {
+      // iframe 沙盒可能禁用 localStorage，忽略即可
+    }
+  }
+
+  function applySettingsToUI() {
+    const { commitLang, pullRebase, autoFetch, forceWithLease } = state.settings;
+    document.querySelectorAll('.seg-btn[data-lang]').forEach((btn) => {
+      btn.classList.toggle('active', btn.dataset.lang === commitLang);
+    });
+    $('opt-pull-rebase').checked = Boolean(pullRebase);
+    $('opt-auto-fetch').checked = Boolean(autoFetch);
+    $('opt-force-lease').checked = Boolean(forceWithLease);
+    $('commit-lang-pill').textContent = commitLang === 'en' ? 'AI: EN' : 'AI: 中文';
+    updateCommitButtonsUI();
+  }
+
+  async function loadSettings() {
+    const local = readLocalSettings();
+    if (local && typeof local === 'object') {
+      Object.assign(state.settings, {
+        commitLang: local.commitLang === 'en' ? 'en' : 'zh',
+        pullRebase: typeof local.pullRebase === 'boolean' ? local.pullRebase : state.settings.pullRebase,
+        autoFetch: typeof local.autoFetch === 'boolean' ? local.autoFetch : state.settings.autoFetch,
+        forceWithLease: typeof local.forceWithLease === 'boolean' ? local.forceWithLease : state.settings.forceWithLease,
+      });
+    }
+    applySettingsToUI();
+
+    try {
+      const res = await sidecarFetch('/api/settings/get', {});
+      if (res.ok && res.data) {
+        state.settings = { ...state.settings, ...res.data };
+        writeLocalSettings(state.settings);
+        applySettingsToUI();
+      }
+    } catch {
+      // 老进程未重启时静默使用本地缓存
+    }
+  }
+
+  async function saveSettings(patch) {
+    state.settings = { ...state.settings, ...patch };
+    writeLocalSettings(state.settings);
+    applySettingsToUI();
+    try {
+      const res = await sidecarFetch('/api/settings/save', state.settings);
+      if (res.ok && res.data) {
+        state.settings = { ...state.settings, ...res.data };
+        writeLocalSettings(state.settings);
+      }
+    } catch {
+      // 忽略后端未重启时的 404
+    }
+  }
+
+  function updateCommitButtonsUI() {
+    const msg = ($('commit-message')?.value || '').trim();
+    const isAmend = Boolean($('opt-amend')?.checked);
+    const useAi = !msg && !isAmend;
+
+    const btnCommit = $('btn-commit');
+    const labelPrimary = $('label-commit-primary');
+    const labelSecondary = $('label-commit-secondary');
+    const svg = btnCommit?.querySelector('svg');
+
+    if (useAi) {
+      btnCommit.className = 'btn btn-ai-primary';
+      if (svg) svg.classList.remove('hidden');
+      labelPrimary.textContent = 'AI 提交';
+      labelSecondary.textContent = 'AI 提交并推送';
+    } else {
+      btnCommit.className = 'btn btn-primary';
+      if (svg) svg.classList.add('hidden');
+      labelPrimary.textContent = isAmend ? 'Amend 提交' : '提交';
+      labelSecondary.textContent = isAmend ? 'Amend 并推送' : '提交并推送';
+    }
+  }
+
   function appendGitLogs(logs) {
     if (!Array.isArray(logs) || logs.length === 0) return;
     for (const item of logs) {
       if (!item || !item.command) continue;
+      if (!item.ok) state.hasUnreadError = true;
       state.logs.unshift({
         time: new Date().toLocaleTimeString(),
         command: item.command,
@@ -104,6 +217,11 @@
 
   function renderLogs() {
     $('log-count').textContent = String(state.logs.length);
+    const dot = $('log-error-dot');
+    if (dot) {
+      dot.classList.toggle('hidden', !state.hasUnreadError);
+    }
+
     const latest = state.logs[0];
     $('log-last-summary').textContent = latest
       ? `${latest.ok ? '✓' : '✗'} ${latest.command} (${latest.durationMs}ms)`
@@ -159,6 +277,7 @@
 
     if (!res.ok) {
       if (!silent) {
+        state.hasUnreadError = true;
         showToast(res.error || '操作失败', 'error');
         state.logs.unshift({
           time: new Date().toLocaleTimeString(),
@@ -310,6 +429,45 @@
     return { dir: relPath.slice(0, idx), name: relPath.slice(idx + 1) };
   }
 
+  function buildClientDraftMessage(stageAll) {
+    const st = state.status;
+    if (!st) return '';
+    let targets = !stageAll && st.staged.length > 0
+      ? st.staged
+      : [...st.staged, ...st.unstaged, ...st.untracked];
+    const seen = new Set();
+    targets = targets.filter((i) => {
+      if (seen.has(i.path)) return false;
+      seen.add(i.path);
+      return true;
+    });
+    if (targets.length === 0) return '';
+
+    const names = targets.map((i) => splitDirAndName(i.path).name);
+    const isEn = state.settings.commitLang === 'en';
+    if (isEn) {
+      return names.length === 1
+        ? `feat: update ${names[0]}`
+        : `feat: update ${names.length} files (${names.slice(0, 2).join(', ')}${names.length > 2 ? ', ...' : ''})`;
+    }
+    return names.length === 1
+      ? `feat: 更新 ${names[0]}`
+      : `feat: 更新 ${names.slice(0, 2).join('、')}${names.length > 2 ? ` 等 ${names.length} 个文件` : ''}`;
+  }
+
+  function buildAgentCommitPrompt({ stageAll, andPush }) {
+    const st = state.status;
+    const isEn = state.settings.commitLang === 'en';
+    const langReq = isEn
+      ? '请务必使用简洁规范的**英文** Conventional Commits 提交说明（如 `feat: ...`、`fix: ...`、`docs: ...`）'
+      : '请务必使用简洁规范的**中文** Conventional Commits 提交说明（如 `feat: ...`、`fix: ...`、`docs: ...`）';
+    const stageReq = stageAll
+      ? '若工作区存在未暂存且安全的改动，请一并暂存后提交'
+      : '若已有已暂存（staged）改动，仅针对已暂存改动生成提交说明并提交';
+    const pushReq = andPush ? '，提交完成后立即推送到远端' : '';
+    return `请针对仓库 \`${state.activeRepo}\`（当前分支：\`${st?.branch || ''}\`）检查 \`git status\` 与 \`git diff\`，排除敏感文件后，${langReq}，${stageReq}${pushReq}。`;
+  }
+
   function renderDiffContent(container, diffState) {
     container.innerHTML = '';
     if (diffState.loading) {
@@ -407,7 +565,7 @@
     const openBtn = document.createElement('button');
     openBtn.className = 'mini-btn';
     openBtn.title = '在 Antigravity 打开文件';
-    openBtn.textContent = '↗';
+    openBtn.innerHTML = SVG_ICONS.open;
     openBtn.onclick = (e) => {
       e.stopPropagation();
       openFileInAntigravity(item.path);
@@ -418,7 +576,7 @@
       const unstageBtn = document.createElement('button');
       unstageBtn.className = 'mini-btn';
       unstageBtn.title = '取消暂存';
-      unstageBtn.textContent = '−';
+      unstageBtn.innerHTML = SVG_ICONS.minus;
       unstageBtn.onclick = async (e) => {
         e.stopPropagation();
         await runBusy(async () => {
@@ -431,7 +589,7 @@
       const stageBtn = document.createElement('button');
       stageBtn.className = 'mini-btn';
       stageBtn.title = '暂存';
-      stageBtn.textContent = '+';
+      stageBtn.innerHTML = SVG_ICONS.plus;
       stageBtn.onclick = async (e) => {
         e.stopPropagation();
         await runBusy(async () => {
@@ -444,7 +602,7 @@
       const discardBtn = document.createElement('button');
       discardBtn.className = 'mini-btn danger';
       discardBtn.title = isUntracked ? '删除未跟踪文件' : '丢弃工作区修改';
-      discardBtn.textContent = '↩';
+      discardBtn.innerHTML = SVG_ICONS.discard;
       discardBtn.onclick = async (e) => {
         e.stopPropagation();
         const confirmed = await showConfirmModal({
@@ -498,26 +656,34 @@
       opBadge.classList.add('hidden');
     }
 
+    const pullBtn = $('btn-pull');
     const behindBadge = $('badge-behind');
     if (st.behind > 0) {
       behindBadge.textContent = `↓${st.behind}`;
       behindBadge.classList.remove('hidden');
+      pullBtn.classList.add('btn-pull-highlight');
+      pullBtn.title = `云端有 ${st.behind} 个较新提交，点击拉取更新`;
     } else {
       behindBadge.classList.add('hidden');
+      pullBtn.classList.remove('btn-pull-highlight');
+      pullBtn.title = '拉取远端更新';
     }
 
+    const pushBtn = $('btn-push');
     const aheadBadge = $('badge-ahead');
     if (st.ahead > 0) {
       aheadBadge.textContent = `↑${st.ahead}`;
       aheadBadge.classList.remove('hidden');
+      pushBtn.classList.add('btn-push-active');
     } else {
       aheadBadge.classList.add('hidden');
+      pushBtn.classList.remove('btn-push-active');
     }
 
     $('label-push').textContent = st.upstream ? '推送' : '发布分支';
     const hasRemote = st.remotes && st.remotes.length > 0;
-    $('btn-pull').disabled = !hasRemote || !st.upstream || state.busy;
-    $('btn-push').disabled = !hasRemote || !st.hasCommits || st.detached || state.busy;
+    pullBtn.disabled = !hasRemote || !st.upstream || state.busy;
+    pushBtn.disabled = !hasRemote || !st.hasCommits || st.detached || state.busy;
     $('btn-sync').disabled = !hasRemote || state.busy;
   }
 
@@ -827,6 +993,10 @@
       const titleRow = document.createElement('div');
       titleRow.className = 'list-title-row';
 
+      const dot = document.createElement('span');
+      dot.className = c.refs.some((r) => r.includes('HEAD')) ? 'timeline-dot head' : 'timeline-dot';
+      titleRow.appendChild(dot);
+
       const hashTag = document.createElement('span');
       hashTag.className = 'tag-pill mono';
       hashTag.textContent = c.shortHash;
@@ -1004,7 +1174,26 @@
     else if (state.activeTab === 'history') await refreshHistory();
   }
 
-  async function refreshAll() {
+  async function maybeAutoFetch({ force = false } = {}) {
+    if (!state.settings.autoFetch && !force) return;
+    if (!state.activeRepo || state.busy || state.autoFetchInFlight) return;
+    const st = state.status;
+    if (!st || !st.remotes || st.remotes.length === 0) return;
+    if (!force && Date.now() - state.lastFetchAt < AUTO_FETCH_INTERVAL_MS) return;
+
+    state.autoFetchInFlight = true;
+    try {
+      await apiCall('/api/fetch', { prune: true }, { silent: true });
+      state.lastFetchAt = Date.now();
+      await refreshStatus({ silent: true });
+    } catch {
+      // 后台自动检测失败不弹窗打扰用户
+    } finally {
+      state.autoFetchInFlight = false;
+    }
+  }
+
+  async function refreshAll({ checkRemote = false } = {}) {
     const isGit = renderRepoSelector();
     if (!isGit) return;
     await refreshStatus();
@@ -1012,9 +1201,16 @@
       refreshActiveTab(),
       state.activeTab === 'stash' ? Promise.resolve() : refreshStashes({ silent: true }),
     ]);
+    if (checkRemote) {
+      await maybeAutoFetch({ force: true });
+    } else if (state.lastFetchAt === 0) {
+      setTimeout(() => {
+        maybeAutoFetch({ force: false }).catch(() => {});
+      }, 1200);
+    }
   }
 
-  async function loadReposFromWorkspace(uris) {
+  async function loadReposFromWorkspace(uris, { checkRemote = false } = {}) {
     state.workspaceUris = Array.isArray(uris) ? uris : [];
     const convId = getConversationId();
 
@@ -1045,8 +1241,9 @@
       state.activeRepo = state.repos[0]?.path || '';
       state.expandedDiffs.clear();
       state.expandedCommits.clear();
+      state.lastFetchAt = 0;
     }
-    await refreshAll();
+    await refreshAll({ checkRemote });
   }
 
   async function runBusy(fn) {
@@ -1080,23 +1277,34 @@
       state.activeRepo = e.target.value;
       state.expandedDiffs.clear();
       state.expandedCommits.clear();
+      state.lastFetchAt = 0;
       await refreshAll();
     };
 
-    $('btn-refresh').onclick = () => runBusy(async () => {
-      let uris = state.workspaceUris;
-      if (!uris || uris.length === 0) {
-        uris = await resolveWorkspaceUris();
-      }
-      await loadReposFromWorkspace(uris);
-    });
+    $('btn-refresh').onclick = () => {
+      const btn = $('btn-refresh');
+      btn.classList.add('spinning');
+      runBusy(async () => {
+        let uris = state.workspaceUris;
+        if (!uris || uris.length === 0) {
+          uris = await resolveWorkspaceUris();
+        }
+        await loadReposFromWorkspace(uris, { checkRemote: true });
+      }).finally(() => {
+        btn.classList.remove('spinning');
+      });
+    };
 
-    $('btn-toggle-log').onclick = () => {
-      $('log-drawer').classList.toggle('collapsed');
+    const toggleLogDrawer = () => {
+      const drawer = $('log-drawer');
+      drawer.classList.toggle('collapsed');
+      if (!drawer.classList.contains('collapsed')) {
+        state.hasUnreadError = false;
+        renderLogs();
+      }
     };
-    $('log-drawer-toggle').onclick = () => {
-      $('log-drawer').classList.toggle('collapsed');
-    };
+    $('btn-toggle-log').onclick = toggleLogDrawer;
+    $('log-drawer-toggle').onclick = toggleLogDrawer;
 
     $('btn-branch-pill').onclick = () => switchTab('branches');
 
@@ -1104,15 +1312,33 @@
       btn.onclick = () => switchTab(btn.dataset.tab);
     });
 
-    $('btn-more-menu').onclick = (e) => {
+    // 右上角设置弹窗控制
+    $('btn-settings').onclick = (e) => {
       e.stopPropagation();
-      $('more-menu').classList.toggle('hidden');
+      $('settings-popover').classList.toggle('hidden');
     };
     document.addEventListener('click', (e) => {
-      if (!$('more-menu').contains(e.target) && e.target !== $('btn-more-menu')) {
-        $('more-menu').classList.add('hidden');
+      if (!$('settings-popover').contains(e.target) && !$('btn-settings').contains(e.target)) {
+        $('settings-popover').classList.add('hidden');
       }
     });
+
+    document.querySelectorAll('.seg-btn[data-lang]').forEach((btn) => {
+      btn.onclick = () => {
+        const lang = btn.dataset.lang === 'en' ? 'en' : 'zh';
+        saveSettings({ commitLang: lang });
+        showToast(lang === 'en' ? 'AI 提交说明语言已切换为英文' : 'AI 提交说明语言已切换为中文', 'success');
+      };
+    });
+
+    $('commit-lang-pill').onclick = () => {
+      const next = state.settings.commitLang === 'en' ? 'zh' : 'en';
+      saveSettings({ commitLang: next });
+      showToast(next === 'en' ? 'AI 提交说明语言：English' : 'AI 提交说明语言：中文', 'info');
+    };
+
+    $('opt-pull-rebase').onchange = (e) => saveSettings({ pullRebase: e.target.checked });
+    $('opt-auto-fetch').onchange = (e) => saveSettings({ autoFetch: e.target.checked });
 
     $('opt-force-lease').onchange = async (e) => {
       if (e.target.checked) {
@@ -1122,8 +1348,12 @@
           confirmText: '确认开启',
           danger: true,
         });
-        if (!ok) e.target.checked = false;
+        if (!ok) {
+          e.target.checked = false;
+          return;
+        }
       }
+      saveSettings({ forceWithLease: e.target.checked });
     };
 
     $('btn-init-repo').onclick = () => runBusy(async () => {
@@ -1141,18 +1371,66 @@
       await refreshStatus();
     });
 
+    // 输入框与 Amend 动态更新提交按钮状态
+    $('commit-message').addEventListener('input', updateCommitButtonsUI);
+    $('opt-amend').addEventListener('change', updateCommitButtonsUI);
+
+    // 一键生成提交说明草稿填入输入框
+    $('btn-ai-draft').onclick = async () => {
+      const st = state.status;
+      if (!st || st.totalChanges === 0) {
+        showToast('当前没有待提交的改动', 'info');
+        return;
+      }
+      const stageAll = $('opt-stage-all').checked;
+      let draft = '';
+      try {
+        const data = await apiCall('/api/suggest-message', {
+          stageAll,
+          lang: state.settings.commitLang,
+        }, { silent: true });
+        draft = data?.message || '';
+      } catch {
+        draft = buildClientDraftMessage(stageAll);
+      }
+
+      if (!draft) {
+        showToast('未检测到可供生成说明的变更文件', 'info');
+        return;
+      }
+      const input = $('commit-message');
+      input.value = draft;
+      updateCommitButtonsUI();
+      input.focus();
+      input.select();
+    };
+
     const doCommit = async ({ andPush = false } = {}) => {
       const message = $('commit-message').value;
       const stageAll = $('opt-stage-all').checked;
       const amend = $('opt-amend').checked;
+
+      // 提交说明为空且非 Amend 时，默认委托当前对话 Agent 自动生成并提交
+      if (!message.trim() && !amend) {
+        if (!state.status || state.status.totalChanges === 0) {
+          showToast('当前工作区没有可提交的更改', 'info');
+          return;
+        }
+        await sendToAgent(buildAgentCommitPrompt({ stageAll, andPush }));
+        return;
+      }
+
       await runBusy(async () => {
         await apiCall('/api/commit', { message, stageAll, amend });
         $('commit-message').value = '';
         $('opt-amend').checked = false;
+        updateCommitButtonsUI();
         state.expandedDiffs.clear();
         if (andPush) {
-          const forceWithLease = $('opt-force-lease').checked;
-          await apiCall('/api/push', { forceWithLease, setUpstream: true });
+          await apiCall('/api/push', {
+            forceWithLease: state.settings.forceWithLease,
+            setUpstream: true,
+          });
           showToast('已提交并推送', 'success');
         } else {
           showToast('提交成功', 'success');
@@ -1171,14 +1449,13 @@
     });
 
     $('btn-pull').onclick = () => runBusy(async () => {
-      const rebase = $('opt-pull-rebase').checked;
-      await apiCall('/api/pull', { rebase });
+      await apiCall('/api/pull', { rebase: state.settings.pullRebase });
       await refreshAll();
       showToast('拉取完成', 'success');
     });
 
     $('btn-push').onclick = () => runBusy(async () => {
-      const forceWithLease = $('opt-force-lease').checked;
+      const forceWithLease = state.settings.forceWithLease;
       if (forceWithLease) {
         const ok = await showConfirmModal({
           title: '确认安全强推 (--force-with-lease)',
@@ -1194,26 +1471,19 @@
     });
 
     $('btn-sync').onclick = () => runBusy(async () => {
-      const rebase = $('opt-pull-rebase').checked;
-      await apiCall('/api/sync', { rebase });
+      await apiCall('/api/sync', { rebase: state.settings.pullRebase });
       await refreshAll();
       showToast('同步完成', 'success');
     });
 
     $('menu-fetch').onclick = () => {
-      $('more-menu').classList.add('hidden');
+      $('settings-popover').classList.add('hidden');
       runBusy(async () => {
         await apiCall('/api/fetch', { prune: true });
+        state.lastFetchAt = Date.now();
         await refreshAll();
         showToast('Fetch 完成', 'success');
       });
-    };
-
-    $('btn-agent-commit').onclick = () => {
-      const st = state.status;
-      sendToAgent(
-        `请针对仓库 \`${state.activeRepo}\`（当前分支：\`${st?.branch || ''}\`）检查 \`git status\` 与 \`git diff\`，排除敏感文件后生成清晰的 Conventional Commits 提交说明并完成暂存与提交。`,
-      );
     };
 
     $('btn-agent-conflicts').onclick = () => {
@@ -1224,14 +1494,14 @@
     };
 
     $('menu-agent-review').onclick = () => {
-      $('more-menu').classList.add('hidden');
+      $('settings-popover').classList.add('hidden');
       sendToAgent(
         `请审查仓库 \`${state.activeRepo}\` 当前未提交的 Git 改动（运行 \`git status\` 与 \`git diff\`），指出潜在 Bug、安全风险或代码改进建议（先只审查不修改文件）。`,
       );
     };
 
     $('menu-agent-pr').onclick = () => {
-      $('more-menu').classList.add('hidden');
+      $('settings-popover').classList.add('hidden');
       sendToAgent(
         `请检查仓库 \`${state.activeRepo}\` 当前分支 \`${state.status?.branch || ''}\` 的提交与差异，如有需要请先确认推送状态，并使用本机 \`gh\` CLI 协助我起草并创建 Pull Request。`,
       );
@@ -1275,6 +1545,7 @@
 
   async function init() {
     bindEvents();
+    await loadSettings();
 
     if (window.sidecar?.onWorkspaceChange) {
       window.sidecar.onWorkspaceChange(async (uris) => {
@@ -1293,12 +1564,14 @@
     state.pollingTimer = setInterval(() => {
       if (document.visibilityState === 'visible' && !state.busy && state.activeRepo) {
         refreshStatus({ silent: true }).catch(() => {});
+        maybeAutoFetch({ force: false }).catch(() => {});
       }
     }, 6000);
 
     window.addEventListener('focus', () => {
       if (!state.busy && state.activeRepo) {
         refreshStatus({ silent: true }).catch(() => {});
+        maybeAutoFetch({ force: false }).catch(() => {});
       }
     });
   }

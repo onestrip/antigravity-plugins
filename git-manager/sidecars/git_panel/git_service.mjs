@@ -1061,3 +1061,127 @@ export async function initRepo(dirPath) {
     return { data: { initialized: true, repoPath: safeRealpath(dirPath) }, gitLog: res };
   });
 }
+
+function inferCommitType(items) {
+  const paths = items.map((i) => i.path.toLowerCase());
+  const allDocs = paths.every((p) => p.endsWith('.md') || p.endsWith('.mdx') || p.includes('/docs/') || p.startsWith('docs/'));
+  if (allDocs) return 'docs';
+
+  const allTests = paths.every((p) => p.includes('/test/') || p.startsWith('test/') || /\.(test|spec)\.[a-z]+$/.test(p));
+  if (allTests) return 'test';
+
+  const allStyles = paths.every((p) => /\.(css|scss|less)$/.test(p));
+  if (allStyles) return 'style';
+
+  const allDeleted = items.every((i) => i.status === 'deleted' || i.code === 'D');
+  if (allDeleted) return 'chore';
+
+  const allChore = paths.every((p) =>
+    /(^|\/)(\.gitignore|package\.json|install\.sh|[^/]+\.(json|ya?ml|toml|lock|conf))$/.test(p),
+  );
+  if (allChore) return 'chore';
+
+  if (paths.some((p) => /fix|bug|patch/.test(p))) return 'fix';
+  return 'feat';
+}
+
+function inferCommitScope(items) {
+  if (items.length === 0) return '';
+  const dirPartsList = items.map((item) => {
+    const clean = item.path.replace(/\\/g, '/');
+    const idx = clean.lastIndexOf('/');
+    if (idx <= 0) return [];
+    return clean.slice(0, idx).split('/').filter(Boolean);
+  });
+
+  let common = dirPartsList[0];
+  for (let i = 1; i < dirPartsList.length; i++) {
+    const cur = dirPartsList[i];
+    let j = 0;
+    while (j < common.length && j < cur.length && common[j] === cur[j]) j++;
+    common = common.slice(0, j);
+    if (common.length === 0) break;
+  }
+
+  const candidate = common.length > 0 ? common[common.length - 1] : '';
+  if (!candidate || candidate.length > 24 || /[^a-zA-Z0-9_-]/.test(candidate)) {
+    return '';
+  }
+  return candidate;
+}
+
+function basenameOf(relPath) {
+  const clean = relPath.replace(/\\/g, '/');
+  const idx = clean.lastIndexOf('/');
+  return idx === -1 ? clean : clean.slice(idx + 1);
+}
+
+/**
+ * 基于当前仓库差异生成规范的 Conventional Commits 草稿（支持中文/英文）。
+ */
+export async function suggestCommitMessage(repoPath, { stageAll: useStageAll = false, lang = 'zh' } = {}) {
+  const normLang = lang === 'en' ? 'en' : 'zh';
+  const statusRes = await getStatus(repoPath);
+  const st = statusRes.data;
+
+  let targets = [];
+  if (!useStageAll && st.staged.length > 0) {
+    targets = st.staged;
+  } else {
+    const map = new Map();
+    for (const item of [...st.staged, ...st.unstaged, ...st.untracked]) {
+      if (!map.has(item.path)) {
+        map.set(item.path, item);
+      }
+    }
+    targets = Array.from(map.values());
+  }
+
+  if (targets.length === 0) {
+    return {
+      data: { message: '', lang: normLang, fileCount: 0, scope: '', type: '' },
+      gitLog: statusRes.gitLog,
+    };
+  }
+
+  const type = inferCommitType(targets);
+  const scope = inferCommitScope(targets);
+  const prefix = scope ? `${type}(${scope})` : type;
+
+  const allAdded = targets.every((i) => i.status === 'added' || i.status === 'untracked' || i.code === 'A' || i.code === '?');
+  const allDeleted = targets.every((i) => i.status === 'deleted' || i.code === 'D');
+  const names = targets.map((i) => basenameOf(i.path));
+
+  let message = '';
+  if (normLang === 'en') {
+    const verb = allAdded ? 'add' : (allDeleted ? 'remove' : 'update');
+    if (names.length === 1) {
+      message = `${prefix}: ${verb} ${names[0]}`;
+    } else if (names.length <= 3) {
+      message = `${prefix}: ${verb} ${names.join(', ')}`;
+    } else {
+      message = `${prefix}: ${verb} ${names.length} files (${names.slice(0, 2).join(', ')}, ...)`;
+    }
+  } else {
+    const verb = allAdded ? '新增' : (allDeleted ? '删除' : '更新');
+    if (names.length === 1) {
+      message = `${prefix}: ${verb} ${names[0]}`;
+    } else if (names.length === 2) {
+      message = `${prefix}: ${verb} ${names[0]} 与 ${names[1]}`;
+    } else {
+      message = `${prefix}: ${verb} ${names.slice(0, 2).join('、')} 等 ${names.length} 个文件`;
+    }
+  }
+
+  return {
+    data: {
+      message,
+      lang: normLang,
+      fileCount: targets.length,
+      scope,
+      type,
+    },
+    gitLog: statusRes.gitLog,
+  };
+}
+

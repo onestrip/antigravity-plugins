@@ -33,6 +33,7 @@ import {
   saveStash,
   stageAll,
   stageFiles,
+  suggestCommitMessage,
   sync,
   unstageAll,
   unstageFiles,
@@ -255,5 +256,26 @@ describe('git_service end-to-end tests', () => {
     await resetSoftLast(localRepo);
     const st = (await getStatus(localRepo)).data;
     assert.ok(st.staged.length >= 1);
+  });
+
+  it('suggests commit messages in Chinese (default) and English', async () => {
+    writeFileSync(join(localRepo, 'guide.md'), '# Guide\n', 'utf8');
+    await stageFiles(localRepo, ['guide.md']);
+
+    const zhRes = (await suggestCommitMessage(localRepo, { stageAll: false, lang: 'zh' })).data;
+    assert.match(zhRes.message, /[\u4e00-\u9fa5]/);
+    assert.ok(zhRes.fileCount >= 1);
+
+    const enRes = (await suggestCommitMessage(localRepo, { stageAll: false, lang: 'en' })).data;
+    assert.match(enRes.message, /^[a-z]+(\([^)]+\))?: /);
+
+    // 清理后应返回空消息
+    await unstageAll(localRepo);
+    await discardFile(localRepo, { path: 'guide.md', untracked: true });
+    // 先把之前 resetSoftLast 留下的 staged 提交掉再测试空工作区
+    await commit(localRepo, { message: 'chore: cleanup staged', stageAll: true });
+    const emptyRes = (await suggestCommitMessage(localRepo, { stageAll: true, lang: 'zh' })).data;
+    assert.equal(emptyRes.message, '');
+    assert.equal(emptyRes.fileCount, 0);
   });
 });

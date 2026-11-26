@@ -13,47 +13,132 @@
     <header class="topbar">
       <div class="topbar-row">
         <div class="repo-picker-wrap">
+          <svg class="repo-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M2.5 3.5A1.5 1.5 0 0 1 4 2h8a1.5 1.5 0 0 1 1.5 1.5v9A1.5 1.5 0 0 1 12 14H4a1.5 1.5 0 0 1-1.5-1.5v-9Z"/>
+            <path d="M5.5 2v12M8.5 5.5h2.5M8.5 8.5h2.5"/>
+          </svg>
           <select id="repo-select" class="repo-select" title="选择当前仓库"></select>
           <span id="repo-single-label" class="repo-single-label hidden"></span>
         </div>
+
         <div class="topbar-actions">
-          <button id="btn-refresh" class="icon-btn" title="刷新状态">↻</button>
-          <button id="btn-toggle-log" class="icon-btn" title="切换 Git 命令日志">⌘</button>
+          <button id="btn-refresh" class="icon-btn" title="刷新状态并检测远端更新" aria-label="刷新状态">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M13.5 8a5.5 5.5 0 1 1-1.35-3.6"/>
+              <path d="M13.5 2.5v2.75h-2.75"/>
+            </svg>
+          </button>
+
+          <button id="btn-toggle-log" class="icon-btn icon-btn-badge" title="切换 Git 活动日志" aria-label="Git 活动日志">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 4.5 6.5 8 3 11.5M8 11.5h5"/>
+            </svg>
+            <span id="log-error-dot" class="status-dot hidden"></span>
+          </button>
+
+          <div class="settings-wrap">
+            <button id="btn-settings" class="icon-btn" title="插件设置" aria-label="插件设置">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="8" cy="8" r="2.2"/>
+                <path d="M8 1.8v1.4M8 12.8v1.4M2.6 4.9l1.2.7M12.2 10.4l1.2.7M2.6 11.1l1.2-.7M12.2 5.6l1.2-.7"/>
+              </svg>
+            </button>
+
+            <div id="settings-popover" class="settings-popover hidden" role="dialog" aria-label="插件设置">
+              <div class="popover-section">
+                <div class="popover-title">AI 提交说明语言</div>
+                <div class="segmented" role="group" aria-label="AI 提交说明语言">
+                  <button type="button" class="seg-btn active" data-lang="zh">中文（默认）</button>
+                  <button type="button" class="seg-btn" data-lang="en">English</button>
+                </div>
+              </div>
+
+              <div class="popover-sep"></div>
+
+              <div class="popover-section">
+                <div class="popover-title">同步与推送偏好</div>
+                <label class="menu-check">
+                  <input type="checkbox" id="opt-pull-rebase" checked>
+                  <span>拉取 / 同步优先使用 Rebase</span>
+                </label>
+                <label class="menu-check">
+                  <input type="checkbox" id="opt-auto-fetch" checked>
+                  <span>自动后台检测远端新提交</span>
+                </label>
+                <label class="menu-check">
+                  <input type="checkbox" id="opt-force-lease">
+                  <span>允许安全强推 (--force-with-lease)</span>
+                </label>
+              </div>
+
+              <div class="popover-sep"></div>
+
+              <div class="popover-section">
+                <div class="popover-title">快捷工具与 Agent 协作</div>
+                <button class="menu-item" id="menu-fetch">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M8 2.5v7.5M5 7l3 3 3-3M3 13h10"/>
+                  </svg>
+                  <span>立即执行 Fetch (--prune)</span>
+                </button>
+                <button class="menu-item" id="menu-agent-review">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="7" cy="7" r="4.2"/>
+                    <path d="m10.2 10.2 3.3 3.3"/>
+                  </svg>
+                  <span>让 Agent 审查当前改动</span>
+                </button>
+                <button class="menu-item" id="menu-agent-pr">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="4.5" cy="4" r="1.5"/>
+                    <circle cx="4.5" cy="12" r="1.5"/>
+                    <circle cx="11.5" cy="11.5" r="1.5"/>
+                    <path d="M4.5 5.5v5M11.5 10V6.5a2 2 0 0 0-2-2H8"/>
+                  </svg>
+                  <span>让 Agent 创建 Pull Request</span>
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 
       <div id="sync-bar" class="sync-bar hidden">
         <button id="btn-branch-pill" class="branch-pill" title="点击切换到分支管理">
-          <span class="branch-dot"></span>
+          <svg class="branch-svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="4.5" cy="3.8" r="1.5"/>
+            <circle cx="4.5" cy="12.2" r="1.5"/>
+            <circle cx="11.5" cy="5.5" r="1.5"/>
+            <path d="M4.5 5.3v5.4M4.5 9.5c0-2 7-1.2 7-2.5"/>
+          </svg>
           <span id="branch-name" class="branch-name">-</span>
           <span id="op-badge" class="op-badge hidden"></span>
         </button>
 
         <div class="sync-buttons">
           <button id="btn-pull" class="btn btn-sm" title="拉取远端更新">
-            <span>拉取</span><span id="badge-behind" class="count-pill hidden"></span>
+            <svg class="btn-svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M8 2.5v8M5 7.5l3 3 3-3M3.5 13h9"/>
+            </svg>
+            <span id="label-pull">拉取</span>
+            <span id="badge-behind" class="count-pill hidden"></span>
           </button>
+
           <button id="btn-push" class="btn btn-sm" title="推送本地提交">
-            <span id="label-push">推送</span><span id="badge-ahead" class="count-pill hidden"></span>
+            <svg class="btn-svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M8 10.5v-8M5 5.5l3-3 3 3M3.5 13h9"/>
+            </svg>
+            <span id="label-push">推送</span>
+            <span id="badge-ahead" class="count-pill hidden"></span>
           </button>
-          <button id="btn-sync" class="btn btn-sm btn-primary" title="Fetch + Pull + Push 一键同步">同步</button>
-          <div class="more-menu-wrap">
-            <button id="btn-more-menu" class="btn btn-sm" title="更多同步与 Agent 操作">⋮</button>
-            <div id="more-menu" class="dropdown-menu hidden">
-              <button class="menu-item" id="menu-fetch">仅执行 Fetch (--prune)</button>
-              <label class="menu-check">
-                <input type="checkbox" id="opt-pull-rebase" checked>
-                <span>同步/拉取优先使用 Rebase</span>
-              </label>
-              <label class="menu-check">
-                <input type="checkbox" id="opt-force-lease">
-                <span>允许安全强推 (--force-with-lease)</span>
-              </label>
-              <div class="menu-sep"></div>
-              <button class="menu-item" id="menu-agent-review">🔍 让 Agent 审查当前改动</button>
-              <button class="menu-item" id="menu-agent-pr">🚀 让 Agent 创建 Pull Request</button>
-            </div>
-          </div>
+
+          <button id="btn-sync" class="btn btn-sm btn-sync-icon" title="一键同步（Fetch + Pull + Push）" aria-label="一键同步">
+            <svg class="btn-svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M13 6A5.2 5.2 0 0 0 4.3 4.3L3 5.5M3 2.8v2.7h2.7"/>
+              <path d="M3 10a5.2 5.2 0 0 0 8.7 1.7L13 10.5M13 13.2v-2.7h-2.7"/>
+            </svg>
+            <span>同步</span>
+          </button>
         </div>
       </div>
     </header>
@@ -61,6 +146,14 @@
     <!-- 空状态 / 初始化引导 -->
     <main id="empty-state" class="empty-state">
       <div class="empty-card">
+        <div class="empty-icon-wrap">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="6" cy="6" r="2.5"/>
+            <circle cx="6" cy="18" r="2.5"/>
+            <circle cx="18" cy="8" r="2.5"/>
+            <path d="M6 8.5v7M6 14c0-3.2 12-2 12-3.5"/>
+          </svg>
+        </div>
         <h2 id="empty-title">正在加载工作区与仓库状态…</h2>
         <p id="empty-desc">正在读取当前 Antigravity 对话的工作区目录。</p>
         <div id="empty-actions" class="empty-actions hidden">
@@ -91,31 +184,54 @@
               <strong>检测到合并冲突</strong>
               <span id="conflict-summary">请先解决冲突后再提交或同步。</span>
             </div>
-            <button id="btn-agent-conflicts" class="btn btn-sm btn-danger">⚠️ 交给 Agent 解决</button>
+            <button id="btn-agent-conflicts" class="btn btn-sm btn-danger">交给 Agent 解决</button>
           </div>
 
-          <!-- 提交卡片 -->
+          <!-- 一体化提交箱 -->
           <div class="card commit-card">
+            <div class="commit-card-head">
+              <div class="commit-head-left">
+                <span class="commit-head-label">提交说明</span>
+                <button type="button" id="commit-lang-pill" class="lang-pill" title="点击切换 AI 生成说明语言">AI: 中文</button>
+              </div>
+              <button type="button" id="btn-ai-draft" class="draft-btn" title="根据当前变更即时生成说明草稿填入输入框">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="m8 2 1.4 3.6L13 7l-3.6 1.4L8 12l-1.4-3.6L3 7l3.6-1.4L8 2Z"/>
+                </svg>
+                <span>AI 生成说明</span>
+              </button>
+            </div>
+
             <textarea
               id="commit-message"
               class="commit-input"
               rows="3"
-              placeholder="输入提交说明（Cmd/Ctrl + Enter 提交）…"
+              placeholder="输入提交说明；留空将默认由 AI 自动生成并提交 (⌘↵)"
             ></textarea>
-            <div class="commit-options">
-              <label class="checkbox-label">
-                <input type="checkbox" id="opt-stage-all" checked>
-                <span>包含未暂存</span>
-              </label>
-              <label class="checkbox-label">
-                <input type="checkbox" id="opt-amend">
-                <span>Amend 追加</span>
-              </label>
-            </div>
-            <div class="commit-actions">
-              <button id="btn-commit" class="btn btn-primary">提交</button>
-              <button id="btn-commit-push" class="btn">提交并推送</button>
-              <button id="btn-agent-commit" class="btn btn-ai" title="由当前 Antigravity 对话中的 Agent 生成提交信息并提交">✨ AI 提交</button>
+
+            <div class="commit-footer">
+              <div class="commit-options">
+                <label class="checkbox-label">
+                  <input type="checkbox" id="opt-stage-all" checked>
+                  <span>包含未暂存</span>
+                </label>
+                <label class="checkbox-label">
+                  <input type="checkbox" id="opt-amend">
+                  <span>Amend</span>
+                </label>
+              </div>
+
+              <div class="commit-actions">
+                <button id="btn-commit" class="btn btn-ai-primary">
+                  <svg class="btn-svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="m8 2 1.4 3.6L13 7l-3.6 1.4L8 12l-1.4-3.6L3 7l3.6-1.4L8 2Z"/>
+                  </svg>
+                  <span id="label-commit-primary">AI 提交</span>
+                </button>
+                <button id="btn-commit-push" class="btn">
+                  <span id="label-commit-secondary">AI 提交并推送</span>
+                </button>
+              </div>
             </div>
           </div>
 
@@ -150,7 +266,7 @@
           </div>
 
           <div id="clean-tree-hint" class="clean-hint hidden">
-            工作区干净，当前没有未提交的更改。
+            工作区干净，当前没有未提交的更改
           </div>
         </section>
 

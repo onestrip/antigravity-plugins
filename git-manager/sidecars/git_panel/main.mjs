@@ -1,7 +1,7 @@
 /**
  * Antigravity 原生 Git 管理 Sidecar 服务入口。
  */
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SidecarApp, Response } from 'sidecar_sdk';
@@ -32,6 +32,7 @@ import {
   saveStash,
   stageAll,
   stageFiles,
+  suggestCommitMessage,
   sync,
   unstageAll,
   unstageFiles,
@@ -41,6 +42,54 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = join(__dirname, 'public');
 const METADATA_CACHE_TTL_MS = 5000;
 const metadataWorkspaceCache = new Map(); // conversationId -> { uris, ts }
+
+const DEFAULT_SETTINGS = {
+  commitLang: 'zh',
+  pullRebase: true,
+  autoFetch: true,
+  forceWithLease: false,
+};
+
+function getSettingsPath() {
+  const dataDir = process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR;
+  if (dataDir && dataDir.trim()) {
+    return join(dataDir.trim(), 'settings.json');
+  }
+  return join(__dirname, '.settings.json');
+}
+
+function sanitizeSettings(raw = {}, base = DEFAULT_SETTINGS) {
+  const next = { ...base };
+  if (raw && typeof raw === 'object') {
+    if (raw.commitLang === 'zh' || raw.commitLang === 'en') {
+      next.commitLang = raw.commitLang;
+    }
+    if (typeof raw.pullRebase === 'boolean') next.pullRebase = raw.pullRebase;
+    if (typeof raw.autoFetch === 'boolean') next.autoFetch = raw.autoFetch;
+    if (typeof raw.forceWithLease === 'boolean') next.forceWithLease = raw.forceWithLease;
+  }
+  return next;
+}
+
+function readSettings() {
+  const filePath = getSettingsPath();
+  try {
+    if (!existsSync(filePath)) return { ...DEFAULT_SETTINGS };
+    const parsed = JSON.parse(readFileSync(filePath, 'utf8'));
+    return sanitizeSettings(parsed, DEFAULT_SETTINGS);
+  } catch {
+    return { ...DEFAULT_SETTINGS };
+  }
+}
+
+function writeSettings(patch = {}) {
+  const current = readSettings();
+  const next = sanitizeSettings(patch, current);
+  const filePath = getSettingsPath();
+  mkdirSync(dirname(filePath), { recursive: true });
+  writeFileSync(filePath, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+  return next;
+}
 
 function serveStatic(filename, contentType) {
   return () => {
@@ -134,7 +183,21 @@ app.page('/', serveStatic('index.html', 'text/html; charset=utf-8'));
 app.page('/styles.css', serveStatic('styles.css', 'text/css; charset=utf-8'));
 app.page('/app.js', serveStatic('app.js', 'application/javascript; charset=utf-8'));
 
-// 全部 API 使用 POST，确保强制经过 sidecar_sdk 的 X-Sidecar-Token 校验
+// 设置持久化接口
+app.api('/api/settings/get', async () => {
+  return { ok: true, data: readSettings() };
+});
+
+app.api('/api/settings/save', async (data) => {
+  try {
+    const updated = writeSettings(data);
+    return { ok: true, data: updated };
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
+  }
+});
+
+// 全部业务 API 使用 POST，确保强制经过 sidecar_sdk 的 X-Sidecar-Token 校验
 app.api('/api/repos', async (data) => {
   try {
     const workspaceUris = resolveWorkspaceUris(app, data);
@@ -148,6 +211,7 @@ app.api('/api/repos', async (data) => {
 registerRepoApi(app, '/api/init', (repoPath) => initRepo(repoPath), { allowNonGit: true });
 registerRepoApi(app, '/api/status', (repoPath) => getStatus(repoPath));
 registerRepoApi(app, '/api/diff', (repoPath, data) => getDiff(repoPath, data));
+registerRepoApi(app, '/api/suggest-message', (repoPath, data) => suggestCommitMessage(repoPath, data));
 registerRepoApi(app, '/api/stage', (repoPath, data) => stageFiles(repoPath, data.paths));
 registerRepoApi(app, '/api/stage-all', (repoPath) => stageAll(repoPath));
 registerRepoApi(app, '/api/unstage', (repoPath, data) => unstageFiles(repoPath, data.paths));
