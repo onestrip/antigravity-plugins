@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Git Manager</title>
+  <script src="/preload.js"></script>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <!-- 顶部栏 -->
+    <header class="topbar">
+      <div class="topbar-row">
+        <div class="repo-picker-wrap">
+          <select id="repo-select" class="repo-select" title="选择当前仓库"></select>
+          <span id="repo-single-label" class="repo-single-label hidden"></span>
+        </div>
+        <div class="topbar-actions">
+          <button id="btn-refresh" class="icon-btn" title="刷新状态">↻</button>
+          <button id="btn-toggle-log" class="icon-btn" title="切换 Git 命令日志">⌘</button>
+        </div>
+      </div>
+
+      <div id="sync-bar" class="sync-bar hidden">
+        <button id="btn-branch-pill" class="branch-pill" title="点击切换到分支管理">
+          <span class="branch-dot"></span>
+          <span id="branch-name" class="branch-name">-</span>
+          <span id="op-badge" class="op-badge hidden"></span>
+        </button>
+
+        <div class="sync-buttons">
+          <button id="btn-pull" class="btn btn-sm" title="拉取远端更新">
+            <span>拉取</span><span id="badge-behind" class="count-pill hidden"></span>
+          </button>
+          <button id="btn-push" class="btn btn-sm" title="推送本地提交">
+            <span id="label-push">推送</span><span id="badge-ahead" class="count-pill hidden"></span>
+          </button>
+          <button id="btn-sync" class="btn btn-sm btn-primary" title="Fetch + Pull + Push 一键同步">同步</button>
+          <div class="more-menu-wrap">
+            <button id="btn-more-menu" class="btn btn-sm" title="更多同步与 Agent 操作">⋮</button>
+            <div id="more-menu" class="dropdown-menu hidden">
+              <button class="menu-item" id="menu-fetch">仅执行 Fetch (--prune)</button>
+              <label class="menu-check">
+                <input type="checkbox" id="opt-pull-rebase" checked>
+                <span>同步/拉取优先使用 Rebase</span>
+              </label>
+              <label class="menu-check">
+                <input type="checkbox" id="opt-force-lease">
+                <span>允许安全强推 (--force-with-lease)</span>
+              </label>
+              <div class="menu-sep"></div>
+              <button class="menu-item" id="menu-agent-review">🔍 让 Agent 审查当前改动</button>
+              <button class="menu-item" id="menu-agent-pr">🚀 让 Agent 创建 Pull Request</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <!-- 空状态 / 初始化引导 -->
+    <main id="empty-state" class="empty-state hidden">
+      <div class="empty-card">
+        <h2 id="empty-title">正在连接工作区…</h2>
+        <p id="empty-desc">等待 Antigravity 传入当前对话的工作区目录。</p>
+        <div id="empty-actions" class="empty-actions hidden">
+          <button id="btn-init-repo" class="btn btn-primary">初始化 Git 仓库 (git init)</button>
+        </div>
+      </div>
+    </main>
+
+    <!-- 主工作区 -->
+    <div id="workspace-main" class="workspace-main hidden">
+      <nav class="tabs" role="tablist">
+        <button class="tab-btn active" data-tab="changes">
+          变更 <span id="tab-changes-count" class="tab-badge hidden">0</span>
+        </button>
+        <button class="tab-btn" data-tab="branches">分支</button>
+        <button class="tab-btn" data-tab="stash">
+          贮藏 <span id="tab-stash-count" class="tab-badge hidden">0</span>
+        </button>
+        <button class="tab-btn" data-tab="history">历史</button>
+      </nav>
+
+      <div class="tab-content-area">
+        <!-- 变更 Tab -->
+        <section id="tab-changes" class="tab-panel active">
+          <!-- 冲突横幅 -->
+          <div id="conflict-banner" class="alert-banner hidden">
+            <div class="alert-text">
+              <strong>检测到合并冲突</strong>
+              <span id="conflict-summary">请先解决冲突后再提交或同步。</span>
+            </div>
+            <button id="btn-agent-conflicts" class="btn btn-sm btn-danger">⚠️ 交给 Agent 解决</button>
+          </div>
+
+          <!-- 提交卡片 -->
+          <div class="card commit-card">
+            <textarea
+              id="commit-message"
+              class="commit-input"
+              rows="3"
+              placeholder="输入提交说明（Cmd/Ctrl + Enter 提交）…"
+            ></textarea>
+            <div class="commit-options">
+              <label class="checkbox-label">
+                <input type="checkbox" id="opt-stage-all" checked>
+                <span>包含未暂存</span>
+              </label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="opt-amend">
+                <span>Amend 追加</span>
+              </label>
+            </div>
+            <div class="commit-actions">
+              <button id="btn-commit" class="btn btn-primary">提交</button>
+              <button id="btn-commit-push" class="btn">提交并推送</button>
+              <button id="btn-agent-commit" class="btn btn-ai" title="由当前 Antigravity 对话中的 Agent 生成提交信息并提交">✨ AI 提交</button>
+            </div>
+          </div>
+
+          <!-- 冲突文件区 -->
+          <div id="group-conflicted" class="file-group hidden">
+            <div class="group-header">
+              <span>冲突文件 (<span id="count-conflicted">0</span>)</span>
+            </div>
+            <div id="list-conflicted" class="file-list"></div>
+          </div>
+
+          <!-- 已暂存区 -->
+          <div id="group-staged" class="file-group">
+            <div class="group-header">
+              <span>已暂存更改 (<span id="count-staged">0</span>)</span>
+              <div class="group-actions">
+                <button id="btn-unstage-all" class="link-btn">全部取消暂存</button>
+              </div>
+            </div>
+            <div id="list-staged" class="file-list"></div>
+          </div>
+
+          <!-- 未暂存区（含未跟踪） -->
+          <div id="group-unstaged" class="file-group">
+            <div class="group-header">
+              <span>未暂存更改 (<span id="count-unstaged">0</span>)</span>
+              <div class="group-actions">
+                <button id="btn-stage-all" class="link-btn">全部暂存</button>
+              </div>
+            </div>
+            <div id="list-unstaged" class="file-list"></div>
+          </div>
+
+          <div id="clean-tree-hint" class="clean-hint hidden">
+            工作区干净，当前没有未提交的更改。
+          </div>
+        </section>
+
+        <!-- 分支 Tab -->
+        <section id="tab-branches" class="tab-panel hidden">
+          <div class="card inline-form-card">
+            <input id="new-branch-name" class="text-input" type="text" placeholder="新分支名称，例如 feat/git-ui">
+            <button id="btn-create-branch" class="btn btn-primary btn-sm">创建并切换</button>
+          </div>
+
+          <div class="file-group">
+            <div class="group-header">
+              <span>本地分支 (<span id="count-local-branches">0</span>)</span>
+            </div>
+            <div id="list-local-branches" class="item-list"></div>
+          </div>
+
+          <details class="collapse-group" id="details-remote-branches">
+            <summary class="group-header clickable">
+              <span>远程分支 (<span id="count-remote-branches">0</span>)</span>
+            </summary>
+            <div id="list-remote-branches" class="item-list"></div>
+          </details>
+
+          <details class="collapse-group" id="details-worktrees">
+            <summary class="group-header clickable">
+              <span>Worktrees (<span id="count-worktrees">0</span>)</span>
+            </summary>
+            <div id="list-worktrees" class="item-list"></div>
+          </details>
+        </section>
+
+        <!-- 贮藏 Tab -->
+        <section id="tab-stash" class="tab-panel hidden">
+          <div class="card stash-form-card">
+            <div class="inline-row">
+              <input id="stash-message" class="text-input" type="text" placeholder="贮藏说明（可选）">
+              <button id="btn-save-stash" class="btn btn-primary btn-sm">保存贮藏</button>
+            </div>
+            <label class="checkbox-label">
+              <input type="checkbox" id="opt-stash-untracked" checked>
+              <span>包含未跟踪文件 (-u)</span>
+            </label>
+          </div>
+
+          <div class="file-group">
+            <div class="group-header">
+              <span>贮藏列表 (<span id="count-stashes">0</span>)</span>
+            </div>
+            <div id="list-stashes" class="item-list"></div>
+          </div>
+        </section>
+
+        <!-- 历史 Tab -->
+        <section id="tab-history" class="tab-panel hidden">
+          <div class="history-toolbar">
+            <span class="muted-text">最近 50 条提交</span>
+            <button id="btn-reset-soft" class="btn btn-sm" title="撤销最新一次提交并将改动保留在暂存区">撤销最近提交 (Soft)</button>
+          </div>
+          <div id="list-history" class="item-list"></div>
+        </section>
+      </div>
+    </div>
+
+    <!-- 底部命令日志抽屉 -->
+    <footer id="log-drawer" class="log-drawer collapsed">
+      <div class="log-header" id="log-drawer-toggle">
+        <span>Git 活动日志 (<span id="log-count">0</span>)</span>
+        <span id="log-last-summary" class="log-last-summary">就绪</span>
+      </div>
+      <div id="log-entries" class="log-entries"></div>
+    </footer>
+  </div>
+
+  <!-- 内联二次确认弹窗（避免 iframe 沙盒禁用 confirm） -->
+  <div id="modal-backdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <h3 id="modal-title" class="modal-title">确认操作</h3>
+      <p id="modal-body" class="modal-body"></p>
+      <pre id="modal-code" class="modal-code hidden"></pre>
+      <div class="modal-actions">
+        <button id="modal-cancel" class="btn">取消</button>
+        <button id="modal-confirm" class="btn btn-primary">确认</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast 提示 -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

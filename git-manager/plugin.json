@@ -1,0 +1,13 @@
+{
+  "name": "git-manager",
+  "displayName": "Git Manager",
+  "version": "1.0.0",
+  "description": "原生 Git 管理插件：在侧边栏提供类 Codex 的分支切换、暂存、Diff、提交、拉取、推送、Stash 与历史管理，并结合 Antigravity Agent 实现 AI 提交、冲突处理与 PR 协作。",
+  "logo": "assets/logo.svg",
+  "repository": "https://github.com/onestrip/antigravity-plugins",
+  "suggestedPrompts": [
+    "检查当前仓库 Git 状态并帮我生成提交",
+    "安全拉取远端更新、处理同步并推送当前分支",
+    "查看当前分支、工作树与最近提交历史"
+  ]
+}
