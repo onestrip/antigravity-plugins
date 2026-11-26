@@ -3,7 +3,7 @@
  */
 import { execFile } from 'node:child_process';
 import { existsSync, lstatSync, openSync, readFileSync, readSync, closeSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
@@ -12,6 +12,7 @@ const execFileAsync = promisify(execFile);
 const MAX_BUFFER = 10 * 1024 * 1024;
 const MAX_DIFF_CHARS = 220 * 1024;
 const MAX_UNTRACKED_BYTES = 160 * 1024;
+const MAX_SAFE_FILE_BYTES = 10 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 60_000;
 
 const repoLocks = new Map();
@@ -38,6 +39,7 @@ export async function runGit(cwd, args, options = {}) {
         ...process.env,
         GIT_TERMINAL_PROMPT: '0',
         LC_ALL: 'C',
+        ...(options.env || {}),
       },
       maxBuffer: MAX_BUFFER,
       timeout: options.timeout ?? DEFAULT_TIMEOUT_MS,
@@ -364,6 +366,75 @@ async function listRemotes(repoPath) {
 }
 
 /**
+ * 识别疑似敏感文件（私钥、环境变量、凭据等），放行常见示例模板文件。
+ */
+export function isSensitivePath(relPath) {
+  const base = basename(relPath).toLowerCase();
+  if (
+    base === '.env.example' ||
+    base === '.env.sample' ||
+    base === '.env.template' ||
+    base.endsWith('.example') ||
+    base.endsWith('.sample')
+  ) {
+    return false;
+  }
+  if (base === '.env' || base.startsWith('.env.')) return true;
+  if (/\.(pem|key|p12|pfx|jks|keystore)$/i.test(base)) return true;
+  if (/^(id_rsa|id_dsa|id_ecdsa|id_ed25519)(\.pub)?$/i.test(base)) return true;
+  if (/(credential|secret)s?\.(json|ya?ml|toml|txt|env|ini|conf)$/i.test(base)) return true;
+  if (base === '.npmrc' || base === '.pypirc' || base === '.netrc') return true;
+  return false;
+}
+
+function inspectFileRisk(repoPath, relPath, status) {
+  if (isSensitivePath(relPath)) {
+    return { sensitive: true, sensitiveReason: 'sensitive' };
+  }
+  if (status === 'deleted') {
+    return { sensitive: false, sensitiveReason: '' };
+  }
+  try {
+    const st = statSync(join(repoPath, relPath));
+    if (st.isFile() && st.size > MAX_SAFE_FILE_BYTES) {
+      return { sensitive: true, sensitiveReason: 'large' };
+    }
+  } catch {
+    // 忽略 stat 失败
+  }
+  return { sensitive: false, sensitiveReason: '' };
+}
+
+async function getNumstatMap(repoPath, staged = false) {
+  const args = staged ? ['diff', '--staged', '--numstat', '-z'] : ['diff', '--numstat', '-z'];
+  const res = await runGit(repoPath, args);
+  const map = new Map();
+  if (!res.ok || !res.stdout) return map;
+
+  const tokens = res.stdout.split('\0');
+  for (let i = 0; i < tokens.length; i++) {
+    const rec = tokens[i];
+    if (!rec) continue;
+    const tabParts = rec.split('\t');
+    if (tabParts.length < 3) continue;
+    const addRaw = tabParts[0];
+    const delRaw = tabParts[1];
+    let filePath = tabParts.slice(2).join('\t');
+    if (filePath === '') {
+      // rename 记录在 -z 下为: add\tdel\t\0orig\0new\0
+      i++; // orig
+      filePath = tokens[++i] || '';
+    }
+    if (!filePath) continue;
+    map.set(filePath, {
+      additions: addRaw === '-' ? null : parseInt(addRaw, 10),
+      deletions: delRaw === '-' ? null : parseInt(delRaw, 10),
+    });
+  }
+  return map;
+}
+
+/**
  * 读取仓库完整状态（porcelain=v2 -z，完美支持中文路径、重命名与冲突）。
  */
 export async function getStatus(repoPath) {
@@ -414,7 +485,8 @@ export async function getStatus(repoPath) {
 
     if (rec.startsWith('? ')) {
       const filePath = rec.slice(2);
-      untracked.push({ path: filePath, status: 'untracked', code: '?' });
+      const risk = inspectFileRisk(repoPath, filePath, 'untracked');
+      untracked.push({ path: filePath, status: 'untracked', code: '?', ...risk });
       continue;
     }
 
@@ -422,7 +494,8 @@ export async function getStatus(repoPath) {
       const parts = rec.split(' ');
       const xy = parts[1] || 'UU';
       const filePath = parts.slice(10).join(' ');
-      conflicted.push({ path: filePath, status: 'conflicted', code: xy });
+      const risk = inspectFileRisk(repoPath, filePath, 'conflicted');
+      conflicted.push({ path: filePath, status: 'conflicted', code: xy, ...risk });
       continue;
     }
 
@@ -433,10 +506,12 @@ export async function getStatus(repoPath) {
       const x = xy[0];
       const y = xy[1];
       if (x && x !== '.') {
-        staged.push({ path: filePath, status: parseChangeLabel(x), code: x });
+        const stLabel = parseChangeLabel(x);
+        staged.push({ path: filePath, status: stLabel, code: x, ...inspectFileRisk(repoPath, filePath, stLabel) });
       }
       if (y && y !== '.') {
-        unstaged.push({ path: filePath, status: parseChangeLabel(y), code: y });
+        const stLabel = parseChangeLabel(y);
+        unstaged.push({ path: filePath, status: stLabel, code: y, ...inspectFileRisk(repoPath, filePath, stLabel) });
       }
       continue;
     }
@@ -449,19 +524,38 @@ export async function getStatus(repoPath) {
       const x = xy[0];
       const y = xy[1];
       if (x && x !== '.') {
-        staged.push({ path: filePath, origPath, status: parseChangeLabel(x), code: x });
+        const stLabel = parseChangeLabel(x);
+        staged.push({ path: filePath, origPath, status: stLabel, code: x, ...inspectFileRisk(repoPath, filePath, stLabel) });
       }
       if (y && y !== '.') {
-        unstaged.push({ path: filePath, origPath, status: parseChangeLabel(y), code: y });
+        const stLabel = parseChangeLabel(y);
+        unstaged.push({ path: filePath, origPath, status: stLabel, code: y, ...inspectFileRisk(repoPath, filePath, stLabel) });
       }
     }
   }
 
-  const [operationState, remotes, ghAvailable] = await Promise.all([
+  const [operationState, remotes, ghAvailable, stagedStat, unstagedStat] = await Promise.all([
     detectRepoOperationState(repoPath),
     listRemotes(repoPath),
     checkGhAvailable(),
+    staged.length > 0 ? getNumstatMap(repoPath, true) : Promise.resolve(new Map()),
+    unstaged.length > 0 ? getNumstatMap(repoPath, false) : Promise.resolve(new Map()),
   ]);
+
+  for (const item of staged) {
+    const stat = stagedStat.get(item.path);
+    if (stat) {
+      item.additions = stat.additions;
+      item.deletions = stat.deletions;
+    }
+  }
+  for (const item of unstaged) {
+    const stat = unstagedStat.get(item.path);
+    if (stat) {
+      item.additions = stat.additions;
+      item.deletions = stat.deletions;
+    }
+  }
 
   const hasCommits = Boolean(headOid && headOid !== '(initial)');
 
@@ -986,18 +1080,25 @@ export async function dropStash(repoPath, { ref } = {}) {
   });
 }
 
-export async function getLog(repoPath, { limit = 50 } = {}) {
-  const safeLimit = Math.max(1, Math.min(200, Number(limit) || 50));
+export async function getLog(repoPath, { limit = 30, skip = 0, query = '' } = {}) {
+  const safeLimit = Math.max(1, Math.min(200, Number(limit) || 30));
+  const safeSkip = Math.max(0, Number(skip) || 0);
   const hasCommits = await checkHasCommits(repoPath);
   if (!hasCommits) {
-    return { data: { commits: [] } };
+    return { data: { commits: [], hasMore: false } };
   }
 
   const fmt = '%H\x1f%h\x1f%an\x1f%cr\x1f%D\x1f%s\x1e';
-  const res = await runGit(repoPath, ['log', `-n`, String(safeLimit), `--format=${fmt}`]);
+  const args = ['log', `--skip=${safeSkip}`, `-n`, String(safeLimit + 1), `--format=${fmt}`];
+  const q = typeof query === 'string' ? query.trim() : '';
+  if (q) {
+    args.push('--regexp-ignore-case', `--grep=${q}`);
+  }
+
+  const res = await runGit(repoPath, args);
   if (!res.ok) throw new Error(res.stderr || '获取提交历史失败');
 
-  const commits = res.stdout
+  const all = res.stdout
     .split('\x1e')
     .map((r) => r.trim())
     .filter(Boolean)
@@ -1016,7 +1117,10 @@ export async function getLog(repoPath, { limit = 50 } = {}) {
       };
     });
 
-  return { data: { commits }, gitLog: res };
+  const hasMore = all.length > safeLimit;
+  const commits = hasMore ? all.slice(0, safeLimit) : all;
+
+  return { data: { commits, hasMore }, gitLog: res };
 }
 
 export async function getCommitDetail(repoPath, { hash } = {}) {
@@ -1184,4 +1288,210 @@ export async function suggestCommitMessage(repoPath, { stageAll: useStageAll = f
     gitLog: statusRes.gitLog,
   };
 }
+
+/**
+ * 批量丢弃工作区所有未暂存更改与未跟踪文件。
+ */
+export async function discardAllUnstaged(repoPath) {
+  return withRepoLock(repoPath, async () => {
+    const st = (await getStatus(repoPath)).data;
+    const logs = [];
+    let discardedCount = 0;
+
+    if (st.unstaged.length > 0) {
+      const res = await runGit(repoPath, ['checkout', '--', '.']);
+      logs.push(res);
+      if (!res.ok) {
+        for (const item of st.unstaged) {
+          const single = await runGit(repoPath, ['restore', '--worktree', '--', item.path]);
+          logs.push(single);
+          if (!single.ok) throw new Error(single.stderr || res.stderr || '批量还原工作区修改失败');
+        }
+      }
+      discardedCount += st.unstaged.length;
+    }
+
+    const root = safeRealpath(repoPath);
+    for (const item of st.untracked) {
+      const safePath = assertSafeRelPath(repoPath, item.path);
+      const target = resolve(root, safePath);
+      if (!isSubPath(root, target) || target === root) {
+        throw new Error(`路径越界，拒绝删除: ${safePath}`);
+      }
+      rmSync(target, { recursive: true, force: true });
+      discardedCount++;
+    }
+
+    return {
+      data: { discardedCount },
+      gitLog: logs[logs.length - 1] || {
+        ok: true,
+        code: 0,
+        stdout: `discarded ${discardedCount} files`,
+        stderr: '',
+        command: 'discardAllUnstaged',
+        durationMs: 1,
+      },
+      logs,
+    };
+  });
+}
+
+const OP_COMMANDS = {
+  rebasing: { continue: ['rebase', '--continue'], skip: ['rebase', '--skip'], abort: ['rebase', '--abort'] },
+  merging: { continue: ['merge', '--continue'], abort: ['merge', '--abort'] },
+  'cherry-picking': { continue: ['cherry-pick', '--continue'], skip: ['cherry-pick', '--skip'], abort: ['cherry-pick', '--abort'] },
+  reverting: { continue: ['revert', '--continue'], skip: ['revert', '--skip'], abort: ['revert', '--abort'] },
+};
+
+async function runOperationAction(repoPath, action) {
+  return withRepoLock(repoPath, async () => {
+    const opState = await detectRepoOperationState(repoPath);
+    if (!opState || !OP_COMMANDS[opState]) {
+      throw new Error('当前没有正在进行的 Merge / Rebase / Cherry-pick / Revert 操作');
+    }
+    const args = OP_COMMANDS[opState][action];
+    if (!args) {
+      throw new Error(`${opState} 状态不支持 ${action} 操作`);
+    }
+    const res = await runGit(repoPath, args, { env: { GIT_EDITOR: 'true' } });
+    if (!res.ok) {
+      const errText = [res.stderr, res.stdout].filter(Boolean).join('\n').trim();
+      throw new Error(errText || `执行 ${args.join(' ')} 失败`);
+    }
+    return { data: { operationState: opState, action, output: res.stdout.trim() }, gitLog: res };
+  });
+}
+
+export const continueOperation = (repoPath) => runOperationAction(repoPath, 'continue');
+export const skipOperation = (repoPath) => runOperationAction(repoPath, 'skip');
+export const abortOperation = (repoPath) => runOperationAction(repoPath, 'abort');
+
+/**
+ * 快速解决单文件冲突：ours(保留本地)、theirs(采用远端)、mark(标记为已解决)。
+ */
+export async function resolveConflict(repoPath, { path: relPath, strategy = 'mark' } = {}) {
+  const safePath = assertSafeRelPath(repoPath, relPath);
+  if (strategy !== 'ours' && strategy !== 'theirs' && strategy !== 'mark') {
+    throw new Error('无效的冲突解决策略');
+  }
+
+  return withRepoLock(repoPath, async () => {
+    const logs = [];
+    if (strategy === 'ours' || strategy === 'theirs') {
+      const coRes = await runGit(repoPath, ['checkout', `--${strategy}`, '--', safePath]);
+      logs.push(coRes);
+      if (!coRes.ok) {
+        throw new Error(coRes.stderr || coRes.stdout || `采用 ${strategy} 失败`);
+      }
+    }
+    const addRes = await runGit(repoPath, ['add', '--', safePath]);
+    logs.push(addRes);
+    if (!addRes.ok) {
+      throw new Error(addRes.stderr || '标记冲突已解决失败');
+    }
+    return { data: { resolved: safePath, strategy }, gitLog: addRes, logs };
+  });
+}
+
+/**
+ * 预览 Stash 详情与完整 Diff。
+ */
+export async function getStashDetail(repoPath, { ref } = {}) {
+  const stashRef = normalizeStashRef(ref);
+  let res = await runGit(repoPath, ['stash', 'show', '--include-untracked', '--stat', '--patch', '--no-color', stashRef]);
+  if (!res.ok) {
+    res = await runGit(repoPath, ['stash', 'show', '--stat', '--patch', '--no-color', stashRef]);
+  }
+  if (!res.ok) {
+    throw new Error(res.stderr || `获取 ${stashRef} 详情失败`);
+  }
+  const { text, truncated } = truncateText(res.stdout);
+  return {
+    data: { ref: stashRef, detail: text, truncated },
+    gitLog: res,
+  };
+}
+
+/**
+ * 为 LLM 提交说明生成采集并脱敏差异上下文（绝不泄露敏感文件正文）。
+ */
+export async function getCommitDiffContext(repoPath, { stageAll: useStageAll = false } = {}) {
+  const st = (await getStatus(repoPath)).data;
+  let targets = [];
+  if (!useStageAll && st.staged.length > 0) {
+    targets = st.staged;
+  } else {
+    const map = new Map();
+    for (const item of [...st.staged, ...st.unstaged, ...st.untracked]) {
+      if (!map.has(item.path)) map.set(item.path, item);
+    }
+    targets = Array.from(map.values());
+  }
+
+  if (targets.length === 0) {
+    return { branch: st.branch, fileCount: 0, files: [], recentCommits: [], diffStat: '', diffSnippet: '' };
+  }
+
+  const recentCommits = [];
+  if (st.hasCommits) {
+    const logRes = await runGit(repoPath, ['log', '-n', '5', '--format=%s']);
+    if (logRes.ok) {
+      for (const line of logRes.stdout.split('\n')) {
+        if (line.trim()) recentCommits.push(line.trim());
+      }
+    }
+  }
+
+  const safePaths = targets.filter((t) => !t.sensitive).map((t) => t.path);
+  const sensitivePaths = targets.filter((t) => t.sensitive).map((t) => t.path);
+  const useStagedOnly = !useStageAll && st.staged.length > 0;
+
+  let diffStat = '';
+  let diffSnippet = '';
+  const MAX_SNIPPET = 12 * 1024;
+
+  if (safePaths.length > 0) {
+    const statArgs = useStagedOnly
+      ? ['diff', '--staged', '--stat', '--', ...safePaths]
+      : (st.hasCommits ? ['diff', 'HEAD', '--stat', '--', ...safePaths] : ['diff', '--staged', '--stat', '--', ...safePaths]);
+    const statRes = await runGit(repoPath, statArgs);
+    if (statRes.ok) diffStat = statRes.stdout.trim();
+
+    const patchArgs = useStagedOnly
+      ? ['diff', '--staged', '--no-color', '--', ...safePaths]
+      : (st.hasCommits ? ['diff', 'HEAD', '--no-color', '--', ...safePaths] : ['diff', '--staged', '--no-color', '--', ...safePaths]);
+    const patchRes = await runGit(repoPath, patchArgs);
+    if (patchRes.ok && patchRes.stdout) {
+      diffSnippet = patchRes.stdout.slice(0, MAX_SNIPPET);
+    }
+
+    // 若包含未跟踪文本文件且尚有配额，补充部分未跟踪预览
+    if ((!useStagedOnly || !st.hasCommits) && diffSnippet.length < MAX_SNIPPET) {
+      for (const item of targets) {
+        if (item.status !== 'untracked' || item.sensitive) continue;
+        const preview = buildUntrackedDiff(repoPath, item.path);
+        if (!preview.isBinary && preview.diff) {
+          const remain = MAX_SNIPPET - diffSnippet.length;
+          if (remain <= 200) break;
+          diffSnippet += `\n${preview.diff.slice(0, remain)}`;
+        }
+      }
+    }
+  }
+
+  if (sensitivePaths.length > 0) {
+    diffSnippet += `\n[已自动脱敏跳过以下敏感/大文件正文内容]: ${sensitivePaths.join(', ')}`;
+  }
+
+  return {
+    branch: st.branch,
+    fileCount: targets.length,
+    files: targets.map((t) => ({ path: t.path, status: t.status, sensitive: Boolean(t.sensitive) })),
+    recentCommits,
+    diffStat,
+    diffSnippet: diffSnippet.trim(),
+  };
+}
+
 

@@ -4,8 +4,10 @@
 (() => {
   'use strict';
 
+  const EXPECTED_SERVER_VERSION = '1.2.0';
   const SETTINGS_STORAGE_KEY = 'agy_git_manager_settings_v1';
   const AUTO_FETCH_INTERVAL_MS = 90_000;
+  const HISTORY_PAGE_SIZE = 30;
 
   const SVG_ICONS = {
     open: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 3.5H3.8A1.3 1.3 0 0 0 2.5 4.8v7.4a1.3 1.3 0 0 0 1.3 1.3h7.4a1.3 1.3 0 0 0 1.3-1.3V9.5"/><path d="M9.5 2.5h4v4M8 8l5.5-5.5"/></svg>',
@@ -14,16 +16,28 @@
     discard: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5.5 4.5 2.5 7l3 2.5"/><path d="M2.8 7H9a3.5 3.5 0 1 1 0 7H6.5"/></svg>',
   };
 
+  const OP_LABELS = {
+    rebasing: '变基（Rebase）进行中',
+    merging: '合并（Merge）进行中',
+    'cherry-picking': '拣选（Cherry-pick）进行中',
+    reverting: '回滚（Revert）进行中',
+  };
+
   const state = {
     workspaceUris: [],
     repos: [],
     activeRepo: '',
     status: null,
+    statusFingerprint: '',
     branches: null,
     stashes: null,
     history: null,
+    historyQuery: '',
     activeTab: 'changes',
+    changesQuery: '',
+    stageAllUserTouched: false,
     expandedDiffs: new Map(), // key -> { loading, data, error }
+    expandedStashes: new Map(), // ref -> { loading, data, error }
     expandedCommits: new Map(), // hash -> { loading, data, error }
     logs: [],
     hasUnreadError: false,
@@ -31,11 +45,13 @@
     lastFetchAt: 0,
     autoFetchInFlight: false,
     pollingTimer: null,
+    updateBannerDismissed: false,
     settings: {
       commitLang: 'zh',
       pullRebase: true,
       autoFetch: true,
       forceWithLease: false,
+      defaultStageAll: false,
     },
   };
 
@@ -48,6 +64,12 @@
     } catch {
       return '';
     }
+  }
+
+  function checkServerVersion(serverVersion) {
+    if (state.updateBannerDismissed) return;
+    const mismatch = serverVersion !== EXPECTED_SERVER_VERSION;
+    $('server-update-banner').classList.toggle('hidden', !mismatch);
   }
 
   function reportFatalError(title, detail) {
@@ -118,19 +140,21 @@
     try {
       localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
     } catch {
-      // iframe 沙盒可能禁用 localStorage，忽略即可
+      // 忽略沙盒限制
     }
   }
 
   function applySettingsToUI() {
-    const { commitLang, pullRebase, autoFetch, forceWithLease } = state.settings;
+    const { commitLang, pullRebase, autoFetch, forceWithLease, defaultStageAll } = state.settings;
     document.querySelectorAll('.seg-btn[data-lang]').forEach((btn) => {
       btn.classList.toggle('active', btn.dataset.lang === commitLang);
     });
+    $('opt-default-stage-all').checked = Boolean(defaultStageAll);
     $('opt-pull-rebase').checked = Boolean(pullRebase);
     $('opt-auto-fetch').checked = Boolean(autoFetch);
     $('opt-force-lease').checked = Boolean(forceWithLease);
     $('commit-lang-pill').textContent = commitLang === 'en' ? 'AI: EN' : 'AI: 中文';
+    syncDefaultStageAllCheckbox(state.status);
     updateCommitButtonsUI();
   }
 
@@ -142,6 +166,7 @@
         pullRebase: typeof local.pullRebase === 'boolean' ? local.pullRebase : state.settings.pullRebase,
         autoFetch: typeof local.autoFetch === 'boolean' ? local.autoFetch : state.settings.autoFetch,
         forceWithLease: typeof local.forceWithLease === 'boolean' ? local.forceWithLease : state.settings.forceWithLease,
+        defaultStageAll: typeof local.defaultStageAll === 'boolean' ? local.defaultStageAll : state.settings.defaultStageAll,
       });
     }
     applySettingsToUI();
@@ -149,7 +174,9 @@
     try {
       const res = await sidecarFetch('/api/settings/get', {});
       if (res.ok && res.data) {
-        state.settings = { ...state.settings, ...res.data };
+        checkServerVersion(res.data.serverVersion);
+        const { serverVersion: _v, ...rest } = res.data;
+        state.settings = { ...state.settings, ...rest };
         writeLocalSettings(state.settings);
         applySettingsToUI();
       }
@@ -160,16 +187,32 @@
 
   async function saveSettings(patch) {
     state.settings = { ...state.settings, ...patch };
+    if (Object.prototype.hasOwnProperty.call(patch, 'defaultStageAll')) {
+      state.stageAllUserTouched = false;
+    }
     writeLocalSettings(state.settings);
     applySettingsToUI();
     try {
       const res = await sidecarFetch('/api/settings/save', state.settings);
       if (res.ok && res.data) {
-        state.settings = { ...state.settings, ...res.data };
+        const { serverVersion: _v, ...rest } = res.data;
+        state.settings = { ...state.settings, ...rest };
         writeLocalSettings(state.settings);
       }
     } catch {
-      // 忽略后端未重启时的 404
+      // 忽略老进程未重启时的接口错误
+    }
+  }
+
+  function syncDefaultStageAllCheckbox(st) {
+    const checkbox = $('opt-stage-all');
+    if (!checkbox || state.stageAllUserTouched) return;
+    if (state.settings.defaultStageAll) {
+      checkbox.checked = true;
+    } else if (st) {
+      checkbox.checked = st.staged.length === 0;
+    } else {
+      checkbox.checked = false;
     }
   }
 
@@ -264,7 +307,7 @@
     }
   }
 
-  async function apiCall(route, payload = {}, { silent = false } = {}) {
+  async function apiCall(route, payload = {}, { silent = false, recordLog = true } = {}) {
     const fullPayload = {
       workspaceUris: state.workspaceUris,
       conversationId: getConversationId(),
@@ -272,8 +315,10 @@
       ...payload,
     };
     const res = await sidecarFetch(route, fullPayload);
-    if (res.logs) appendGitLogs(res.logs);
-    else if (res.gitLog) appendGitLogs([res.gitLog]);
+    if (recordLog || !res.ok) {
+      if (res.logs && res.logs.length > 0) appendGitLogs(res.logs);
+      else if (res.gitLog) appendGitLogs([res.gitLog]);
+    }
 
     if (!res.ok) {
       if (!silent) {
@@ -468,6 +513,73 @@
     return `请针对仓库 \`${state.activeRepo}\`（当前分支：\`${st?.branch || ''}\`）检查 \`git status\` 与 \`git diff\`，排除敏感文件后，${langReq}，${stageReq}${pushReq}。`;
   }
 
+  function getTargetCommitFiles(stageAll) {
+    const st = state.status;
+    if (!st) return [];
+    if (!stageAll && st.staged.length > 0) return st.staged;
+    const map = new Map();
+    for (const item of [...st.staged, ...st.unstaged, ...st.untracked]) {
+      if (!map.has(item.path)) map.set(item.path, item);
+    }
+    return Array.from(map.values());
+  }
+
+  async function confirmSensitiveFilesIfNeeded(stageAll) {
+    const targets = getTargetCommitFiles(stageAll);
+    const risky = targets.filter((f) => f.sensitive);
+    if (risky.length === 0) return true;
+
+    const listText = risky
+      .map((f) => `${f.sensitiveReason === 'large' ? '[大文件 >10MB]' : '[疑似敏感文件]'} ${f.path}`)
+      .join('\n');
+    return showConfirmModal({
+      title: '提交安全预警',
+      body: '本次待提交清单中包含疑似敏感文件或超大文件（建议先取消暂存或加入 .gitignore）。确定仍要提交它们吗？',
+      code: listText,
+      confirmText: '仍要提交',
+      danger: true,
+    });
+  }
+
+  function computeStatusFingerprint(st) {
+    if (!st) return '';
+    const mapFiles = (arr) => (arr || []).map((f) => `${f.path}|${f.code}|${f.additions ?? ''}|${f.deletions ?? ''}|${f.sensitive ? 1 : 0}`).join(';');
+    return [
+      st.repoPath,
+      st.branch,
+      st.headOid,
+      st.detached ? 1 : 0,
+      st.upstream,
+      st.ahead,
+      st.behind,
+      st.operationState || '',
+      (st.remotes || []).map((r) => `${r.name}:${r.fetchUrl}`).join(','),
+      mapFiles(st.staged),
+      mapFiles(st.unstaged),
+      mapFiles(st.untracked),
+      mapFiles(st.conflicted),
+    ].join('##');
+  }
+
+  function saveDiffScrollPositions(container) {
+    const scrolls = new Map();
+    if (!container) return scrolls;
+    container.querySelectorAll('.diff-box[data-scroll-key]').forEach((el) => {
+      scrolls.set(el.dataset.scrollKey, el.scrollTop);
+    });
+    return scrolls;
+  }
+
+  function restoreDiffScrollPositions(container, scrolls) {
+    if (!container || scrolls.size === 0) return;
+    container.querySelectorAll('.diff-box[data-scroll-key]').forEach((el) => {
+      const top = scrolls.get(el.dataset.scrollKey);
+      if (typeof top === 'number' && top > 0) {
+        el.scrollTop = top;
+      }
+    });
+  }
+
   function renderDiffContent(container, diffState) {
     container.innerHTML = '';
     if (diffState.loading) {
@@ -493,19 +605,53 @@
       return;
     }
 
+    let oldLn = 0;
+    let newLn = 0;
+
     for (const line of data.diff.split('\n')) {
       const row = document.createElement('div');
       row.className = 'diff-line';
-      if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('diff ') || line.startsWith('index ') || line.startsWith('new file')) {
+
+      let lnLabel = '';
+      if (
+        line.startsWith('+++') ||
+        line.startsWith('---') ||
+        line.startsWith('diff ') ||
+        line.startsWith('index ') ||
+        line.startsWith('new file') ||
+        line.startsWith('deleted file') ||
+        line.startsWith('commit ') ||
+        line.startsWith('Author:') ||
+        line.startsWith('Date:')
+      ) {
         row.classList.add('meta');
       } else if (line.startsWith('@@')) {
         row.classList.add('hunk');
+        const m = /^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@/.exec(line);
+        if (m) {
+          oldLn = parseInt(m[1], 10);
+          newLn = parseInt(m[2], 10);
+        }
       } else if (line.startsWith('+')) {
         row.classList.add('add');
+        lnLabel = newLn > 0 ? String(newLn++) : '';
       } else if (line.startsWith('-')) {
         row.classList.add('del');
+        lnLabel = oldLn > 0 ? String(oldLn++) : '';
+      } else if (newLn > 0 && (line.startsWith(' ') || line === '')) {
+        oldLn++;
+        lnLabel = String(newLn++);
       }
-      row.textContent = line || ' ';
+
+      const lnSpan = document.createElement('span');
+      lnSpan.className = 'diff-ln';
+      lnSpan.textContent = lnLabel;
+
+      const txtSpan = document.createElement('span');
+      txtSpan.className = 'diff-txt';
+      txtSpan.textContent = line || ' ';
+
+      row.append(lnSpan, txtSpan);
       container.appendChild(row);
     }
   }
@@ -519,7 +665,7 @@
     state.expandedDiffs.set(key, { loading: true });
     renderChanges();
     try {
-      const data = await apiCall('/api/diff', { file, staged, untracked }, { silent: true });
+      const data = await apiCall('/api/diff', { file, staged, untracked }, { silent: true, recordLog: false });
       state.expandedDiffs.set(key, { loading: false, data });
     } catch (err) {
       state.expandedDiffs.set(key, { loading: false, error: err.message });
@@ -530,6 +676,7 @@
   function buildFileRow(item, kind) {
     const isStaged = kind === 'staged';
     const isUntracked = kind === 'untracked';
+    const isConflicted = kind === 'conflicted';
     const key = `${kind}:${item.path}`;
 
     const wrapper = document.createElement('div');
@@ -539,8 +686,8 @@
     row.className = 'file-row';
 
     const badge = document.createElement('span');
-    const code = isUntracked ? 'U' : (kind === 'conflicted' ? '!' : (item.code || 'M'));
-    badge.className = `status-badge status-${kind === 'conflicted' ? 'X' : code}`;
+    const code = isUntracked ? 'U' : (isConflicted ? '!' : (item.code || 'M'));
+    badge.className = `status-badge status-${isConflicted ? 'X' : code}`;
     badge.textContent = code;
     row.appendChild(badge);
 
@@ -559,8 +706,55 @@
     }
     row.appendChild(pathWrap);
 
+    if (item.sensitive) {
+      const risk = document.createElement('span');
+      risk.className = 'risk-tag';
+      risk.textContent = item.sensitiveReason === 'large' ? '大文件' : '敏感';
+      risk.title = item.sensitiveReason === 'large' ? '文件大于 10MB' : '疑似密钥或环境变量文件';
+      row.appendChild(risk);
+    }
+
+    if (typeof item.additions === 'number' || typeof item.deletions === 'number') {
+      const statEl = document.createElement('span');
+      statEl.className = 'numstat';
+      if (item.additions > 0) {
+        const a = document.createElement('span');
+        a.className = 'numstat-add';
+        a.textContent = `+${item.additions}`;
+        statEl.appendChild(a);
+      }
+      if (item.deletions > 0) {
+        const d = document.createElement('span');
+        d.className = 'numstat-del';
+        d.textContent = `-${item.deletions}`;
+        statEl.appendChild(d);
+      }
+      if (statEl.childNodes.length > 0) row.appendChild(statEl);
+    }
+
     const actions = document.createElement('div');
     actions.className = 'row-actions';
+
+    if (isConflicted) {
+      const mkConflictBtn = (label, strategy, tip) => {
+        const btn = document.createElement('button');
+        btn.className = 'mini-btn';
+        btn.title = tip;
+        btn.textContent = label;
+        btn.onclick = (e) => {
+          e.stopPropagation();
+          runBusy(async () => {
+            await apiCall('/api/conflict/resolve', { path: item.path, strategy });
+            await refreshStatus();
+            showToast(`已处理冲突: ${name}`, 'success');
+          });
+        };
+        return btn;
+      };
+      actions.appendChild(mkConflictBtn('本地', 'ours', '采用本地当前版本 (--ours) 并标记已解决'));
+      actions.appendChild(mkConflictBtn('远端', 'theirs', '采用传入版本 (--theirs) 并标记已解决'));
+      actions.appendChild(mkConflictBtn('已解决', 'mark', '保留当前文件内容并暂存标记为已解决'));
+    }
 
     const openBtn = document.createElement('button');
     openBtn.className = 'mini-btn';
@@ -585,7 +779,7 @@
         });
       };
       actions.appendChild(unstageBtn);
-    } else {
+    } else if (!isConflicted) {
       const stageBtn = document.createElement('button');
       stageBtn.className = 'mini-btn';
       stageBtn.title = '暂存';
@@ -631,6 +825,7 @@
     if (state.expandedDiffs.has(key)) {
       const diffBox = document.createElement('div');
       diffBox.className = 'diff-box';
+      diffBox.dataset.scrollKey = key;
       renderDiffContent(diffBox, state.expandedDiffs.get(key));
       wrapper.appendChild(diffBox);
     }
@@ -687,9 +882,35 @@
     $('btn-sync').disabled = !hasRemote || state.busy;
   }
 
+  function renderOperationBanner(st) {
+    const banner = $('operation-banner');
+    const hasConflicts = st.conflicted.length > 0;
+    const op = st.operationState;
+
+    if (!op && !hasConflicts) {
+      banner.classList.add('hidden');
+      return;
+    }
+
+    banner.classList.remove('hidden');
+    banner.classList.toggle('danger', hasConflicts);
+
+    $('operation-title').textContent = op ? (OP_LABELS[op] || `${op} 进行中`) : '检测到合并冲突';
+    $('operation-summary').textContent = hasConflicts
+      ? `共有 ${st.conflicted.length} 个冲突文件等待处理`
+      : '冲突已处理完毕，可点击“继续”完成流程';
+
+    $('btn-op-continue').classList.toggle('hidden', !op || hasConflicts);
+    $('btn-op-skip').classList.toggle('hidden', !op || op === 'merging');
+    $('btn-op-abort').classList.toggle('hidden', !op);
+    $('btn-agent-conflicts').classList.toggle('hidden', !hasConflicts);
+  }
+
   function renderChanges() {
     const st = state.status;
     if (!st) return;
+
+    const scrolls = saveDiffScrollPositions($('tab-changes'));
 
     const badge = $('tab-changes-count');
     if (st.totalChanges > 0) {
@@ -699,27 +920,33 @@
       badge.classList.add('hidden');
     }
 
-    const conflictBanner = $('conflict-banner');
+    renderOperationBanner(st);
+
+    // 变更数 >= 5 或已有过滤词时显现搜索框
+    const showFilter = st.totalChanges >= 5 || Boolean(state.changesQuery);
+    $('changes-filter-wrap').classList.toggle('hidden', !showFilter);
+    const q = state.changesQuery.trim().toLowerCase();
+    const matchFilter = (item) => !q || item.path.toLowerCase().includes(q);
+
     const groupConflicted = $('group-conflicted');
+    const filteredConflicted = st.conflicted.filter(matchFilter);
     if (st.conflicted.length > 0) {
-      conflictBanner.classList.remove('hidden');
-      $('conflict-summary').textContent = `共 ${st.conflicted.length} 个冲突文件等待处理`;
       groupConflicted.classList.remove('hidden');
-      $('count-conflicted').textContent = String(st.conflicted.length);
+      $('count-conflicted').textContent = String(filteredConflicted.length);
       const listConflicted = $('list-conflicted');
       listConflicted.innerHTML = '';
-      for (const item of st.conflicted) {
+      for (const item of filteredConflicted) {
         listConflicted.appendChild(buildFileRow(item, 'conflicted'));
       }
     } else {
-      conflictBanner.classList.add('hidden');
       groupConflicted.classList.add('hidden');
     }
 
-    $('count-staged').textContent = String(st.staged.length);
+    const filteredStaged = st.staged.filter(matchFilter);
+    $('count-staged').textContent = String(filteredStaged.length);
     const listStaged = $('list-staged');
     listStaged.innerHTML = '';
-    for (const item of st.staged) {
+    for (const item of filteredStaged) {
       listStaged.appendChild(buildFileRow(item, 'staged'));
     }
     $('btn-unstage-all').classList.toggle('hidden', st.staged.length === 0);
@@ -728,15 +955,18 @@
       ...st.unstaged.map((u) => ({ ...u, _kind: 'unstaged' })),
       ...st.untracked.map((u) => ({ ...u, _kind: 'untracked' })),
     ];
-    $('count-unstaged').textContent = String(unstagedAll.length);
+    const filteredUnstaged = unstagedAll.filter(matchFilter);
+    $('count-unstaged').textContent = String(filteredUnstaged.length);
     const listUnstaged = $('list-unstaged');
     listUnstaged.innerHTML = '';
-    for (const item of unstagedAll) {
+    for (const item of filteredUnstaged) {
       listUnstaged.appendChild(buildFileRow(item, item._kind));
     }
     $('btn-stage-all').classList.toggle('hidden', unstagedAll.length === 0);
+    $('btn-discard-all').classList.toggle('hidden', unstagedAll.length === 0);
 
     $('clean-tree-hint').classList.toggle('hidden', st.totalChanges > 0);
+    restoreDiffScrollPositions($('tab-changes'), scrolls);
   }
 
   function renderBranches() {
@@ -820,15 +1050,33 @@
         delBtn.onclick = async () => {
           const ok = await showConfirmModal({
             title: '删除本地分支',
-            body: `确定要删除分支 "${b.name}" 吗？（默认使用安全删除 git branch -d）`,
+            body: `确定要删除分支 "${b.name}" 吗？（优先尝试安全删除 git branch -d）`,
             confirmText: '删除分支',
             danger: true,
           });
           if (!ok) return;
           await runBusy(async () => {
-            await apiCall('/api/branch/delete', { name: b.name, force: false });
-            await refreshBranches();
-            showToast(`已删除分支 ${b.name}`, 'success');
+            try {
+              await apiCall('/api/branch/delete', { name: b.name, force: false }, { silent: true });
+              await refreshBranches();
+              showToast(`已删除分支 ${b.name}`, 'success');
+            } catch (err) {
+              const msg = err?.message || '';
+              if (/not fully merged|未完全合并/i.test(msg)) {
+                const forceOk = await showConfirmModal({
+                  title: '分支尚未合并，是否强制删除？',
+                  body: `分支 "${b.name}" 包含尚未合并到当前分支的提交。确定要使用 git branch -D 强制删除吗？此操作可能导致孤立提交丢失。`,
+                  confirmText: '强制删除 (-D)',
+                  danger: true,
+                });
+                if (!forceOk) return;
+                await apiCall('/api/branch/delete', { name: b.name, force: true });
+                await refreshBranches();
+                showToast(`已强制删除分支 ${b.name}`, 'success');
+              } else {
+                showToast(msg || '删除分支失败', 'error');
+              }
+            }
           });
         };
         actions.appendChild(delBtn);
@@ -909,8 +1157,11 @@
     }
 
     for (const s of list) {
+      const item = document.createElement('div');
+      item.className = 'file-item';
+
       const row = document.createElement('div');
-      row.className = 'list-row';
+      row.className = 'list-row clickable';
       const main = document.createElement('div');
       main.className = 'list-main';
 
@@ -929,25 +1180,32 @@
       const applyBtn = document.createElement('button');
       applyBtn.className = 'mini-btn';
       applyBtn.textContent = 'Apply';
-      applyBtn.onclick = () => runBusy(async () => {
-        await apiCall('/api/stash/apply', { ref: s.ref });
-        await refreshAll();
-        showToast(`已应用 ${s.ref}`, 'success');
-      });
+      applyBtn.onclick = (e) => {
+        e.stopPropagation();
+        runBusy(async () => {
+          await apiCall('/api/stash/apply', { ref: s.ref });
+          await refreshAll();
+          showToast(`已应用 ${s.ref}`, 'success');
+        });
+      };
 
       const popBtn = document.createElement('button');
       popBtn.className = 'mini-btn';
       popBtn.textContent = 'Pop';
-      popBtn.onclick = () => runBusy(async () => {
-        await apiCall('/api/stash/pop', { ref: s.ref });
-        await refreshAll();
-        showToast(`已弹出 ${s.ref}`, 'success');
-      });
+      popBtn.onclick = (e) => {
+        e.stopPropagation();
+        runBusy(async () => {
+          await apiCall('/api/stash/pop', { ref: s.ref });
+          await refreshAll();
+          showToast(`已弹出 ${s.ref}`, 'success');
+        });
+      };
 
       const dropBtn = document.createElement('button');
       dropBtn.className = 'mini-btn danger';
       dropBtn.textContent = 'Drop';
-      dropBtn.onclick = async () => {
+      dropBtn.onclick = async (e) => {
+        e.stopPropagation();
         const ok = await showConfirmModal({
           title: '删除 Stash 记录',
           body: `确定要丢弃 "${s.ref}" (${s.message}) 吗？`,
@@ -957,6 +1215,7 @@
         if (!ok) return;
         await runBusy(async () => {
           await apiCall('/api/stash/drop', { ref: s.ref });
+          state.expandedStashes.delete(s.ref);
           await refreshStashes();
           showToast(`已删除 ${s.ref}`, 'success');
         });
@@ -964,7 +1223,34 @@
 
       actions.append(applyBtn, popBtn, dropBtn);
       row.appendChild(actions);
-      container.appendChild(row);
+
+      row.onclick = async () => {
+        if (state.expandedStashes.has(s.ref)) {
+          state.expandedStashes.delete(s.ref);
+          renderStashes();
+          return;
+        }
+        state.expandedStashes.set(s.ref, { loading: true });
+        renderStashes();
+        try {
+          const data = await apiCall('/api/stash/detail', { ref: s.ref }, { silent: true, recordLog: false });
+          state.expandedStashes.set(s.ref, { loading: false, data: { diff: data.detail } });
+        } catch (err) {
+          state.expandedStashes.set(s.ref, { loading: false, error: err.message });
+        }
+        renderStashes();
+      };
+
+      item.appendChild(row);
+
+      if (state.expandedStashes.has(s.ref)) {
+        const box = document.createElement('div');
+        box.className = 'diff-box';
+        renderDiffContent(box, state.expandedStashes.get(s.ref));
+        item.appendChild(box);
+      }
+
+      container.appendChild(item);
     }
   }
 
@@ -972,10 +1258,13 @@
     const commits = state.history?.commits || [];
     const container = $('list-history');
     container.innerHTML = '';
+
+    $('history-more-wrap').classList.toggle('hidden', !state.history?.hasMore);
+
     if (commits.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'diff-empty';
-      empty.textContent = '当前分支尚无提交历史';
+      empty.textContent = state.historyQuery ? '未找到匹配的提交记录' : '当前分支尚无提交历史';
       container.appendChild(empty);
       return;
     }
@@ -1069,7 +1358,7 @@
         state.expandedCommits.set(c.hash, { loading: true });
         renderHistory();
         try {
-          const data = await apiCall('/api/commit-detail', { hash: c.hash }, { silent: true });
+          const data = await apiCall('/api/commit-detail', { hash: c.hash }, { silent: true, recordLog: false });
           state.expandedCommits.set(c.hash, { loading: false, data: { diff: data.detail } });
         } catch (err) {
           state.expandedCommits.set(c.hash, { loading: false, error: err.message });
@@ -1140,31 +1429,52 @@
     return true;
   }
 
-  async function refreshStatus({ silent = false } = {}) {
+  async function refreshStatus({ silent = false, forceRender = false } = {}) {
     if (!state.activeRepo) return;
     const activeEntry = state.repos.find((r) => r.path === state.activeRepo);
     if (!activeEntry?.isGitRepo) return;
 
-    state.status = await apiCall('/api/status', {}, { silent });
+    const nextStatus = await apiCall('/api/status', {}, { silent, recordLog: false });
+    const nextFp = computeStatusFingerprint(nextStatus);
+    if (silent && !forceRender && nextFp === state.statusFingerprint) {
+      return;
+    }
+
+    state.status = nextStatus;
+    state.statusFingerprint = nextFp;
+    syncDefaultStageAllCheckbox(nextStatus);
     renderHeaderAndSyncBar();
     renderChanges();
   }
 
   async function refreshBranches({ silent = false } = {}) {
     if (!state.activeRepo) return;
-    state.branches = await apiCall('/api/branches', {}, { silent });
+    state.branches = await apiCall('/api/branches', {}, { silent, recordLog: false });
     renderBranches();
   }
 
   async function refreshStashes({ silent = false } = {}) {
     if (!state.activeRepo) return;
-    state.stashes = await apiCall('/api/stashes', {}, { silent });
+    state.stashes = await apiCall('/api/stashes', {}, { silent, recordLog: false });
     renderStashes();
   }
 
-  async function refreshHistory({ silent = false } = {}) {
+  async function refreshHistory({ silent = false, append = false } = {}) {
     if (!state.activeRepo) return;
-    state.history = await apiCall('/api/log', { limit: 50 }, { silent });
+    const skip = append ? (state.history?.commits?.length || 0) : 0;
+    const res = await apiCall(
+      '/api/log',
+      { limit: HISTORY_PAGE_SIZE, skip, query: state.historyQuery },
+      { silent, recordLog: false },
+    );
+    if (append && state.history) {
+      state.history = {
+        commits: [...state.history.commits, ...res.commits],
+        hasMore: Boolean(res.hasMore),
+      };
+    } else {
+      state.history = res;
+    }
     renderHistory();
   }
 
@@ -1183,11 +1493,11 @@
 
     state.autoFetchInFlight = true;
     try {
-      await apiCall('/api/fetch', { prune: true }, { silent: true });
+      await apiCall('/api/fetch', { prune: true }, { silent: true, recordLog: force });
       state.lastFetchAt = Date.now();
       await refreshStatus({ silent: true });
     } catch {
-      // 后台自动检测失败不弹窗打扰用户
+      // 后台自动检测失败不打扰用户
     } finally {
       state.autoFetchInFlight = false;
     }
@@ -1196,7 +1506,7 @@
   async function refreshAll({ checkRemote = false } = {}) {
     const isGit = renderRepoSelector();
     if (!isGit) return;
-    await refreshStatus();
+    await refreshStatus({ forceRender: true });
     await Promise.all([
       refreshActiveTab(),
       state.activeTab === 'stash' ? Promise.resolve() : refreshStashes({ silent: true }),
@@ -1218,6 +1528,7 @@
       state.repos = [];
       state.activeRepo = '';
       state.status = null;
+      state.statusFingerprint = '';
       renderRepoSelector();
       return;
     }
@@ -1232,6 +1543,8 @@
       return;
     }
 
+    checkServerVersion(res.data?.serverVersion);
+
     if (Array.isArray(res.data?.workspaceUris) && res.data.workspaceUris.length > 0) {
       state.workspaceUris = res.data.workspaceUris;
     }
@@ -1239,7 +1552,9 @@
     state.repos = res.data?.repos || [];
     if (!state.repos.some((r) => r.path === state.activeRepo)) {
       state.activeRepo = state.repos[0]?.path || '';
+      state.stageAllUserTouched = false;
       state.expandedDiffs.clear();
+      state.expandedStashes.clear();
       state.expandedCommits.clear();
       state.lastFetchAt = 0;
     }
@@ -1275,10 +1590,18 @@
   function bindEvents() {
     $('repo-select').onchange = async (e) => {
       state.activeRepo = e.target.value;
+      state.stageAllUserTouched = false;
+      state.statusFingerprint = '';
       state.expandedDiffs.clear();
+      state.expandedStashes.clear();
       state.expandedCommits.clear();
       state.lastFetchAt = 0;
       await refreshAll();
+    };
+
+    $('btn-dismiss-update').onclick = () => {
+      state.updateBannerDismissed = true;
+      $('server-update-banner').classList.add('hidden');
     };
 
     $('btn-refresh').onclick = () => {
@@ -1337,6 +1660,7 @@
       showToast(next === 'en' ? 'AI 提交说明语言：English' : 'AI 提交说明语言：中文', 'info');
     };
 
+    $('opt-default-stage-all').onchange = (e) => saveSettings({ defaultStageAll: e.target.checked });
     $('opt-pull-rebase').onchange = (e) => saveSettings({ pullRebase: e.target.checked });
     $('opt-auto-fetch').onchange = (e) => saveSettings({ autoFetch: e.target.checked });
 
@@ -1364,34 +1688,71 @@
 
     $('btn-stage-all').onclick = () => runBusy(async () => {
       await apiCall('/api/stage-all');
+      state.stageAllUserTouched = false;
       await refreshStatus();
     });
     $('btn-unstage-all').onclick = () => runBusy(async () => {
       await apiCall('/api/unstage-all');
+      state.stageAllUserTouched = false;
       await refreshStatus();
     });
 
-    // 输入框与 Amend 动态更新提交按钮状态
+    $('btn-discard-all').onclick = async () => {
+      const ok = await showConfirmModal({
+        title: '确认丢弃全部未暂存更改',
+        body: '将还原所有已跟踪文件的未暂存修改，并永久删除所有未跟踪文件。此操作无法撤销！',
+        confirmText: '全部丢弃',
+        danger: true,
+      });
+      if (!ok) return;
+      await runBusy(async () => {
+        await apiCall('/api/discard-all');
+        state.expandedDiffs.clear();
+        await refreshStatus();
+        showToast('已丢弃工作区未暂存更改', 'success');
+      });
+    };
+
+    $('changes-filter').addEventListener('input', (e) => {
+      state.changesQuery = e.target.value || '';
+      renderChanges();
+    });
+
+    $('opt-stage-all').addEventListener('change', () => {
+      state.stageAllUserTouched = true;
+    });
+
     $('commit-message').addEventListener('input', updateCommitButtonsUI);
     $('opt-amend').addEventListener('change', updateCommitButtonsUI);
 
-    // 一键生成提交说明草稿填入输入框
+    // 调用后端真 LLM 生成说明并填入输入框
     $('btn-ai-draft').onclick = async () => {
       const st = state.status;
       if (!st || st.totalChanges === 0) {
         showToast('当前没有待提交的改动', 'info');
         return;
       }
+      const btn = $('btn-ai-draft');
+      const label = $('label-ai-draft');
       const stageAll = $('opt-stage-all').checked;
+      btn.disabled = true;
+      label.textContent = 'AI 生成中…';
+
       let draft = '';
+      let source = 'heuristic';
       try {
-        const data = await apiCall('/api/suggest-message', {
-          stageAll,
-          lang: state.settings.commitLang,
-        }, { silent: true });
+        const data = await apiCall(
+          '/api/suggest-message',
+          { stageAll, lang: state.settings.commitLang },
+          { silent: true, recordLog: false },
+        );
         draft = data?.message || '';
+        source = data?.source || 'heuristic';
       } catch {
         draft = buildClientDraftMessage(stageAll);
+      } finally {
+        btn.disabled = false;
+        label.textContent = 'AI 生成说明';
       }
 
       if (!draft) {
@@ -1403,6 +1764,7 @@
       updateCommitButtonsUI();
       input.focus();
       input.select();
+      showToast(source === 'llm' ? '✨ 已由 AI 生成提交说明' : '已生成提交说明草稿', 'success');
     };
 
     const doCommit = async ({ andPush = false } = {}) => {
@@ -1410,13 +1772,68 @@
       const stageAll = $('opt-stage-all').checked;
       const amend = $('opt-amend').checked;
 
-      // 提交说明为空且非 Amend 时，默认委托当前对话 Agent 自动生成并提交
+      if (!state.status || (state.status.totalChanges === 0 && !amend)) {
+        showToast('当前工作区没有可提交的更改', 'info');
+        return;
+      }
+
+      const safeProceed = await confirmSensitiveFilesIfNeeded(stageAll);
+      if (!safeProceed) return;
+
+      // 提交说明为空且非 Amend：优先通过侧边栏静默 LLM 摘要并自动提交，失败时回退委托对话 Agent
       if (!message.trim() && !amend) {
-        if (!state.status || state.status.totalChanges === 0) {
-          showToast('当前工作区没有可提交的更改', 'info');
-          return;
-        }
-        await sendToAgent(buildAgentCommitPrompt({ stageAll, andPush }));
+        await runBusy(async () => {
+          const btnCommit = $('btn-commit');
+          const btnPush = $('btn-commit-push');
+          const origPrimary = $('label-commit-primary').textContent;
+          const origSecondary = $('label-commit-secondary').textContent;
+          btnCommit.disabled = true;
+          btnPush.disabled = true;
+          $('label-commit-primary').textContent = 'AI 生成中…';
+
+          try {
+            let aiMsg = '';
+            let source = 'heuristic';
+            try {
+              const suggest = await apiCall(
+                '/api/suggest-message',
+                { stageAll, lang: state.settings.commitLang },
+                { silent: true, recordLog: false },
+              );
+              aiMsg = suggest?.message || '';
+              source = suggest?.source || 'heuristic';
+            } catch {
+              aiMsg = '';
+            }
+
+            if (aiMsg && source === 'llm') {
+              $('label-commit-primary').textContent = '提交中…';
+              await apiCall('/api/commit', { message: aiMsg, stageAll, amend: false });
+              state.stageAllUserTouched = false;
+              state.expandedDiffs.clear();
+              if (andPush) {
+                await apiCall('/api/push', {
+                  forceWithLease: state.settings.forceWithLease,
+                  setUpstream: true,
+                });
+                showToast(`✨ AI 已提交并推送：${aiMsg.split('\n')[0]}`, 'success');
+              } else {
+                showToast(`✨ AI 已提交：${aiMsg.split('\n')[0]}`, 'success');
+              }
+              await refreshAll();
+              return;
+            }
+
+            // 后端尚不支持 LLM 或临时不可用时，回退委托当前对话 Agent
+            await sendToAgent(buildAgentCommitPrompt({ stageAll, andPush }));
+          } finally {
+            btnCommit.disabled = false;
+            btnPush.disabled = false;
+            $('label-commit-primary').textContent = origPrimary;
+            $('label-commit-secondary').textContent = origSecondary;
+            updateCommitButtonsUI();
+          }
+        });
         return;
       }
 
@@ -1424,6 +1841,7 @@
         await apiCall('/api/commit', { message, stageAll, amend });
         $('commit-message').value = '';
         $('opt-amend').checked = false;
+        state.stageAllUserTouched = false;
         updateCommitButtonsUI();
         state.expandedDiffs.clear();
         if (andPush) {
@@ -1447,6 +1865,34 @@
         doCommit({ andPush: false });
       }
     });
+
+    // Merge / Rebase 流程控制按钮
+    $('btn-op-continue').onclick = () => runBusy(async () => {
+      await apiCall('/api/operation/continue');
+      await refreshAll();
+      showToast('已继续并完成流程', 'success');
+    });
+
+    $('btn-op-skip').onclick = () => runBusy(async () => {
+      await apiCall('/api/operation/skip');
+      await refreshAll();
+      showToast('已跳过当前提交', 'success');
+    });
+
+    $('btn-op-abort').onclick = async () => {
+      const ok = await showConfirmModal({
+        title: '确认中止当前流程',
+        body: `确定要中止正在进行的 ${state.status?.operationState || ''} 并恢复到操作前状态吗？`,
+        confirmText: '确认中止',
+        danger: true,
+      });
+      if (!ok) return;
+      await runBusy(async () => {
+        await apiCall('/api/operation/abort');
+        await refreshAll();
+        showToast('已中止流程', 'success');
+      });
+    };
 
     $('btn-pull').onclick = () => runBusy(async () => {
       await apiCall('/api/pull', { rebase: state.settings.pullRebase });
@@ -1540,6 +1986,20 @@
         await refreshAll();
         showToast('已回退最新提交到暂存区', 'success');
       });
+    };
+
+    // 历史搜索（300ms 防抖）与分页加载更多
+    let searchTimer = null;
+    $('history-search').addEventListener('input', (e) => {
+      state.historyQuery = e.target.value || '';
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => {
+        refreshHistory({ silent: true }).catch(() => {});
+      }, 300);
+    });
+
+    $('btn-history-more').onclick = () => {
+      refreshHistory({ append: true }).catch(() => {});
     };
   }
 

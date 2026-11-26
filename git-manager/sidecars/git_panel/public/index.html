@@ -56,7 +56,11 @@
               <div class="popover-sep"></div>
 
               <div class="popover-section">
-                <div class="popover-title">同步与推送偏好</div>
+                <div class="popover-title">提交与同步偏好</div>
+                <label class="menu-check" title="关闭时：有已暂存文件则仅提交暂存区，无暂存文件时自动勾选包含未暂存">
+                  <input type="checkbox" id="opt-default-stage-all">
+                  <span>提交时默认勾选“包含未暂存”</span>
+                </label>
                 <label class="menu-check">
                   <input type="checkbox" id="opt-pull-rebase" checked>
                   <span>拉取 / 同步优先使用 Rebase</span>
@@ -141,6 +145,11 @@
           </button>
         </div>
       </div>
+
+      <div id="server-update-banner" class="update-banner hidden">
+        <span>插件后端有更新，建议在扩展管理中重启 Git Manager 以启用全部新功能。</span>
+        <button id="btn-dismiss-update" class="link-btn" type="button">知道了</button>
+      </div>
     </header>
 
     <!-- 空状态 / 初始化引导 -->
@@ -178,13 +187,20 @@
       <div class="tab-content-area">
         <!-- 变更 Tab -->
         <section id="tab-changes" class="tab-panel active">
-          <!-- 冲突横幅 -->
-          <div id="conflict-banner" class="alert-banner hidden">
-            <div class="alert-text">
-              <strong>检测到合并冲突</strong>
-              <span id="conflict-summary">请先解决冲突后再提交或同步。</span>
+          <!-- 进行中的 Merge/Rebase 或冲突横幅 -->
+          <div id="operation-banner" class="alert-banner hidden">
+            <div class="alert-head">
+              <div class="alert-text">
+                <strong id="operation-title">检测到合并冲突</strong>
+                <span id="operation-summary">请先解决冲突后再继续或中止。</span>
+              </div>
             </div>
-            <button id="btn-agent-conflicts" class="btn btn-sm btn-danger">交给 Agent 解决</button>
+            <div class="op-actions">
+              <button id="btn-op-continue" class="btn btn-sm btn-primary hidden" type="button">继续</button>
+              <button id="btn-op-skip" class="btn btn-sm hidden" type="button">跳过</button>
+              <button id="btn-op-abort" class="btn btn-sm btn-danger hidden" type="button">中止</button>
+              <button id="btn-agent-conflicts" class="btn btn-sm btn-ai hidden" type="button">交给 Agent 解决</button>
+            </div>
           </div>
 
           <!-- 一体化提交箱 -->
@@ -194,11 +210,11 @@
                 <span class="commit-head-label">提交说明</span>
                 <button type="button" id="commit-lang-pill" class="lang-pill" title="点击切换 AI 生成说明语言">AI: 中文</button>
               </div>
-              <button type="button" id="btn-ai-draft" class="draft-btn" title="根据当前变更即时生成说明草稿填入输入框">
+              <button type="button" id="btn-ai-draft" class="draft-btn" title="调用大模型阅读当前差异并生成提交说明填入输入框">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <path d="m8 2 1.4 3.6L13 7l-3.6 1.4L8 12l-1.4-3.6L3 7l3.6-1.4L8 2Z"/>
                 </svg>
-                <span>AI 生成说明</span>
+                <span id="label-ai-draft">AI 生成说明</span>
               </button>
             </div>
 
@@ -211,8 +227,8 @@
 
             <div class="commit-footer">
               <div class="commit-options">
-                <label class="checkbox-label">
-                  <input type="checkbox" id="opt-stage-all" checked>
+                <label class="checkbox-label" title="勾选后将自动暂存工作区全部改动并一并提交">
+                  <input type="checkbox" id="opt-stage-all">
                   <span>包含未暂存</span>
                 </label>
                 <label class="checkbox-label">
@@ -233,6 +249,11 @@
                 </button>
               </div>
             </div>
+          </div>
+
+          <!-- 按需显现的变更文件过滤 -->
+          <div id="changes-filter-wrap" class="filter-wrap hidden">
+            <input id="changes-filter" class="filter-input" type="search" placeholder="过滤变更文件…">
           </div>
 
           <!-- 冲突文件区 -->
@@ -259,6 +280,7 @@
             <div class="group-header">
               <span>未暂存更改 (<span id="count-unstaged">0</span>)</span>
               <div class="group-actions">
+                <button id="btn-discard-all" class="link-btn danger-link hidden" type="button">全部丢弃</button>
                 <button id="btn-stage-all" class="link-btn">全部暂存</button>
               </div>
             </div>
@@ -323,10 +345,13 @@
         <!-- 历史 Tab -->
         <section id="tab-history" class="tab-panel hidden">
           <div class="history-toolbar">
-            <span class="muted-text">最近 50 条提交</span>
-            <button id="btn-reset-soft" class="btn btn-sm" title="撤销最新一次提交并将改动保留在暂存区">撤销最近提交 (Soft)</button>
+            <input id="history-search" class="filter-input" type="search" placeholder="搜索提交说明…">
+            <button id="btn-reset-soft" class="btn btn-sm" title="撤销最新一次提交并将改动保留在暂存区">撤销最近提交</button>
           </div>
           <div id="list-history" class="item-list"></div>
+          <div id="history-more-wrap" class="history-more-wrap hidden">
+            <button id="btn-history-more" class="btn btn-sm" type="button">加载更多历史</button>
+          </div>
         </section>
       </div>
     </div>
