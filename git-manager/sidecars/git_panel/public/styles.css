@@ -207,6 +207,13 @@ html, body {
   padding: 0 2px;
 }
 
+.popover-hint {
+  font-size: 11px;
+  color: var(--gm-fg-muted);
+  line-height: 1.4;
+  padding: 0 2px;
+}
+
 .popover-sep {
   height: 1px;
   background: var(--gm-border);
@@ -1290,13 +1297,16 @@ html, body {
 
 .toast {
   pointer-events: auto;
-  max-width: 300px;
+  max-width: 320px;
   padding: 7px 11px;
   border-radius: 8px;
   background: var(--gm-card);
   border: 1px solid var(--gm-card-border);
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.2);
   font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-line;
+  word-break: break-word;
 }
 
 .toast.error {

@@ -47,7 +47,7 @@ import {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = join(__dirname, 'public');
-const SERVER_VERSION = '1.2.0';
+const SERVER_VERSION = '1.3.0';
 const METADATA_CACHE_TTL_MS = 5000;
 const metadataWorkspaceCache = new Map(); // conversationId -> { uris, ts }
 
@@ -334,6 +334,8 @@ function registerRepoApi(app, route, handler, { allowNonGit = false } = {}) {
       return {
         ok: false,
         error: err?.message || String(err),
+        gitLog: err?.gitLog ?? null,
+        logs: Array.isArray(err?.logs) ? err.logs : (err?.gitLog ? [err.gitLog] : []),
       };
     }
   });
@@ -344,6 +346,7 @@ const app = new SidecarApp();
 app.page('/', serveStatic('index.html', 'text/html; charset=utf-8'));
 app.page('/styles.css', serveStatic('styles.css', 'text/css; charset=utf-8'));
 app.page('/app.js', serveStatic('app.js', 'application/javascript; charset=utf-8'));
+app.page('/message_formatter.mjs', serveStatic('message_formatter.mjs', 'application/javascript; charset=utf-8'));
 
 // 设置持久化接口
 app.api('/api/settings/get', async () => {

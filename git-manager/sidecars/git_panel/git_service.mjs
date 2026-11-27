@@ -24,6 +24,18 @@ function formatArgForLog(arg) {
   return JSON.stringify(s);
 }
 
+function createGitError(message, gitLogOrLogs) {
+  const err = new Error(message);
+  if (Array.isArray(gitLogOrLogs)) {
+    err.logs = gitLogOrLogs.filter(Boolean);
+    err.gitLog = err.logs[err.logs.length - 1] || null;
+  } else if (gitLogOrLogs) {
+    err.gitLog = gitLogOrLogs;
+    err.logs = [gitLogOrLogs];
+  }
+  return err;
+}
+
 /**
  * 安全执行 git 子进程，不使用 shell 拼接。
  */
@@ -271,7 +283,7 @@ async function assertValidNewBranchName(repoPath, name) {
   const cleaned = assertSafeRefInput(name, '分支名称');
   const check = await runGit(repoPath, ['check-ref-format', '--branch', cleaned]);
   if (!check.ok) {
-    throw new Error(`分支名称不符合 Git 规范: ${cleaned}`);
+    throw createGitError(`分支名称不符合 Git 规范: ${cleaned}`, check);
   }
   return cleaned;
 }
@@ -440,7 +452,7 @@ async function getNumstatMap(repoPath, staged = false) {
 export async function getStatus(repoPath) {
   const statusRes = await runGit(repoPath, ['status', '--porcelain=v2', '--branch', '-uall', '-z']);
   if (!statusRes.ok) {
-    throw new Error(statusRes.stderr || '获取 Git 状态失败');
+    throw createGitError(statusRes.stderr || '获取 Git 状态失败', statusRes);
   }
 
   let branch = '';
@@ -656,7 +668,7 @@ export async function getDiff(repoPath, { file, staged = false, untracked = fals
 
   const diffRes = await runGit(repoPath, args);
   if (!diffRes.ok) {
-    throw new Error(diffRes.stderr || '获取 Diff 失败');
+    throw createGitError(diffRes.stderr || '获取 Diff 失败', diffRes);
   }
 
   const raw = diffRes.stdout;
@@ -683,7 +695,7 @@ export async function stageFiles(repoPath, paths) {
   const safePaths = paths.map((p) => assertSafeRelPath(repoPath, p));
   return withRepoLock(repoPath, async () => {
     const res = await runGit(repoPath, ['add', '--', ...safePaths]);
-    if (!res.ok) throw new Error(res.stderr || '暂存文件失败');
+    if (!res.ok) throw createGitError(res.stderr || '暂存文件失败', res);
     return { data: { staged: safePaths }, gitLog: res };
   });
 }
@@ -691,7 +703,7 @@ export async function stageFiles(repoPath, paths) {
 export async function stageAll(repoPath) {
   return withRepoLock(repoPath, async () => {
     const res = await runGit(repoPath, ['add', '-A']);
-    if (!res.ok) throw new Error(res.stderr || '全部暂存失败');
+    if (!res.ok) throw createGitError(res.stderr || '全部暂存失败', res);
     return { data: { stagedAll: true }, gitLog: res };
   });
 }
@@ -707,7 +719,7 @@ export async function unstageFiles(repoPath, paths) {
       ? ['reset', '-q', 'HEAD', '--', ...safePaths]
       : ['rm', '--cached', '-r', '-q', '--', ...safePaths];
     const res = await runGit(repoPath, args);
-    if (!res.ok) throw new Error(res.stderr || '取消暂存失败');
+    if (!res.ok) throw createGitError(res.stderr || '取消暂存失败', res);
     return { data: { unstaged: safePaths }, gitLog: res };
   });
 }
@@ -717,7 +729,7 @@ export async function unstageAll(repoPath) {
     const hasCommits = await checkHasCommits(repoPath);
     const args = hasCommits ? ['reset', '-q', 'HEAD'] : ['rm', '--cached', '-r', '-q', '--ignore-unmatch', '.'];
     const res = await runGit(repoPath, args);
-    if (!res.ok) throw new Error(res.stderr || '全部取消暂存失败');
+    if (!res.ok) throw createGitError(res.stderr || '全部取消暂存失败', res);
     return { data: { unstagedAll: true }, gitLog: res };
   });
 }
@@ -742,7 +754,7 @@ export async function discardFile(repoPath, { path: relPath, untracked = false }
     if (!res.ok) {
       const restoreRes = await runGit(repoPath, ['restore', '--worktree', '--', safePath]);
       if (!restoreRes.ok) {
-        throw new Error(restoreRes.stderr || res.stderr || '丢弃改动失败');
+        throw createGitError(restoreRes.stderr || res.stderr || '丢弃改动失败', [res, restoreRes]);
       }
       return { data: { discarded: safePath, untracked: false }, gitLog: restoreRes };
     }
@@ -761,7 +773,7 @@ export async function commit(repoPath, { message = '', stageAll: shouldStageAll 
     if (shouldStageAll) {
       const addRes = await runGit(repoPath, ['add', '-A']);
       logs.push(addRes);
-      if (!addRes.ok) throw new Error(addRes.stderr || '自动暂存全部改动失败');
+      if (!addRes.ok) throw createGitError(addRes.stderr || '自动暂存全部改动失败', logs);
     }
 
     const args = ['commit'];
@@ -780,7 +792,7 @@ export async function commit(repoPath, { message = '', stageAll: shouldStageAll 
     logs.push(commitRes);
     if (!commitRes.ok) {
       const errText = [commitRes.stderr, commitRes.stdout].filter(Boolean).join('\n').trim();
-      throw new Error(errText || '提交失败');
+      throw createGitError(errText || '提交失败', logs);
     }
 
     return {
@@ -796,7 +808,7 @@ export async function fetch(repoPath, { prune = true } = {}) {
     const args = ['fetch', '--all'];
     if (prune) args.push('--prune');
     const res = await runGit(repoPath, args);
-    if (!res.ok) throw new Error(res.stderr || res.stdout || 'Fetch 失败');
+    if (!res.ok) throw createGitError(res.stderr || res.stdout || 'Fetch 失败', res);
     return { data: { fetched: true, output: (res.stderr || res.stdout).trim() }, gitLog: res };
   });
 }
@@ -808,7 +820,7 @@ export async function pull(repoPath, { rebase = false } = {}) {
     const res = await runGit(repoPath, args);
     if (!res.ok) {
       const errText = [res.stderr, res.stdout].filter(Boolean).join('\n').trim();
-      throw new Error(errText || '拉取失败');
+      throw createGitError(errText || '拉取失败', res);
     }
     return { data: { pulled: true, output: (res.stdout || res.stderr).trim() }, gitLog: res };
   });
@@ -843,7 +855,7 @@ export async function push(repoPath, { forceWithLease = false, setUpstream = tru
     const res = await runGit(repoPath, args);
     if (!res.ok) {
       const errText = [res.stderr, res.stdout].filter(Boolean).join('\n').trim();
-      throw new Error(errText || '推送失败');
+      throw createGitError(errText || '推送失败', res);
     }
     return { data: { pushed: true, output: (res.stderr || res.stdout).trim() }, gitLog: res };
   });
@@ -857,13 +869,13 @@ export async function sync(repoPath, { rebase = true } = {}) {
     const fetchRes = await runGit(repoPath, ['fetch', '--all', '--prune']);
     logs.push(fetchRes);
     if (!fetchRes.ok) {
-      throw new Error(fetchRes.stderr || fetchRes.stdout || '同步失败：Fetch 阶段出错');
+      throw createGitError(fetchRes.stderr || fetchRes.stdout || '同步失败：Fetch 阶段出错', logs);
     }
     steps.push({ step: 'fetch', ok: true });
 
     let st = (await getStatus(repoPath)).data;
     if (st.conflicted.length > 0) {
-      throw new Error('存在未解决的冲突文件，请先处理冲突后再同步');
+      throw createGitError('存在未解决的冲突文件，请先处理冲突后再同步', logs);
     }
 
     if (st.upstream && st.behind > 0) {
@@ -872,7 +884,7 @@ export async function sync(repoPath, { rebase = true } = {}) {
       logs.push(pullRes);
       if (!pullRes.ok) {
         const errText = [pullRes.stderr, pullRes.stdout].filter(Boolean).join('\n').trim();
-        throw new Error(`同步失败（Pull 阶段）：${errText}`);
+        throw createGitError(`同步失败（Pull 阶段）：${errText}`, logs);
       }
       steps.push({ step: 'pull', ok: true });
       st = (await getStatus(repoPath)).data;
@@ -888,7 +900,7 @@ export async function sync(repoPath, { rebase = true } = {}) {
       logs.push(pushRes);
       if (!pushRes.ok) {
         const errText = [pushRes.stderr, pushRes.stdout].filter(Boolean).join('\n').trim();
-        throw new Error(`同步失败（Push 阶段）：${errText}`);
+        throw createGitError(`同步失败（Push 阶段）：${errText}`, logs);
       }
       steps.push({ step: 'push', ok: true });
     }
@@ -911,7 +923,7 @@ export async function getBranches(repoPath) {
     runGit(repoPath, ['worktree', 'list', '--porcelain']),
   ]);
 
-  if (!localRes.ok) throw new Error(localRes.stderr || '获取分支列表失败');
+  if (!localRes.ok) throw createGitError(localRes.stderr || '获取分支列表失败', localRes);
 
   const local = localRes.stdout
     .split('\n')
@@ -980,7 +992,7 @@ export async function checkout(repoPath, { target, isRemote = false } = {}) {
       res = await runGit(repoPath, fallbackArgs);
     }
     if (!res.ok) {
-      throw new Error(res.stderr || res.stdout || `切换分支 ${safeTarget} 失败`);
+      throw createGitError(res.stderr || res.stdout || `切换分支 ${safeTarget} 失败`, res);
     }
     return { data: { checkedOut: safeTarget }, gitLog: res };
   });
@@ -995,7 +1007,7 @@ export async function createBranch(repoPath, { name, startPoint = '', checkout: 
     if (start) args.push(start);
     const res = await runGit(repoPath, args);
     if (!res.ok) {
-      throw new Error(res.stderr || res.stdout || `创建分支 ${branchName} 失败`);
+      throw createGitError(res.stderr || res.stdout || `创建分支 ${branchName} 失败`, res);
     }
     return { data: { branch: branchName, checkedOut: Boolean(shouldCheckout) }, gitLog: res };
   });
@@ -1010,7 +1022,7 @@ export async function deleteBranch(repoPath, { name, force = false } = {}) {
     }
     const res = await runGit(repoPath, ['branch', force ? '-D' : '-d', branchName]);
     if (!res.ok) {
-      throw new Error(res.stderr || res.stdout || `删除分支 ${branchName} 失败`);
+      throw createGitError(res.stderr || res.stdout || `删除分支 ${branchName} 失败`, res);
     }
     return { data: { deleted: branchName }, gitLog: res };
   });
@@ -1022,7 +1034,7 @@ export async function mergeBranch(repoPath, { name } = {}) {
     const res = await runGit(repoPath, ['merge', '--no-edit', branchName]);
     if (!res.ok) {
       const errText = [res.stderr, res.stdout].filter(Boolean).join('\n').trim();
-      throw new Error(errText || `合并分支 ${branchName} 失败`);
+      throw createGitError(errText || `合并分支 ${branchName} 失败`, res);
     }
     return { data: { merged: branchName, output: res.stdout.trim() }, gitLog: res };
   });
@@ -1030,7 +1042,7 @@ export async function mergeBranch(repoPath, { name } = {}) {
 
 export async function listStashes(repoPath) {
   const res = await runGit(repoPath, ['stash', 'list', '--format=%gd\x1f%h\x1f%cr\x1f%gs']);
-  if (!res.ok) throw new Error(res.stderr || '获取 Stash 列表失败');
+  if (!res.ok) throw createGitError(res.stderr || '获取 Stash 列表失败', res);
   const items = res.stdout
     .split('\n')
     .filter(Boolean)
@@ -1048,7 +1060,7 @@ export async function saveStash(repoPath, { message = '', includeUntracked = tru
     const msg = typeof message === 'string' ? message.trim() : '';
     if (msg) args.push('-m', msg);
     const res = await runGit(repoPath, args);
-    if (!res.ok) throw new Error(res.stderr || res.stdout || '保存 Stash 失败');
+    if (!res.ok) throw createGitError(res.stderr || res.stdout || '保存 Stash 失败', res);
     return { data: { saved: true, output: res.stdout.trim() }, gitLog: res };
   });
 }
@@ -1057,7 +1069,7 @@ export async function applyStash(repoPath, { ref } = {}) {
   const stashRef = normalizeStashRef(ref);
   return withRepoLock(repoPath, async () => {
     const res = await runGit(repoPath, ['stash', 'apply', stashRef]);
-    if (!res.ok) throw new Error(res.stderr || res.stdout || '应用 Stash 失败');
+    if (!res.ok) throw createGitError(res.stderr || res.stdout || '应用 Stash 失败', res);
     return { data: { applied: stashRef }, gitLog: res };
   });
 }
@@ -1066,7 +1078,7 @@ export async function popStash(repoPath, { ref } = {}) {
   const stashRef = normalizeStashRef(ref);
   return withRepoLock(repoPath, async () => {
     const res = await runGit(repoPath, ['stash', 'pop', stashRef]);
-    if (!res.ok) throw new Error(res.stderr || res.stdout || '弹出 Stash 失败');
+    if (!res.ok) throw createGitError(res.stderr || res.stdout || '弹出 Stash 失败', res);
     return { data: { popped: stashRef }, gitLog: res };
   });
 }
@@ -1075,7 +1087,7 @@ export async function dropStash(repoPath, { ref } = {}) {
   const stashRef = normalizeStashRef(ref);
   return withRepoLock(repoPath, async () => {
     const res = await runGit(repoPath, ['stash', 'drop', stashRef]);
-    if (!res.ok) throw new Error(res.stderr || res.stdout || '删除 Stash 失败');
+    if (!res.ok) throw createGitError(res.stderr || res.stdout || '删除 Stash 失败', res);
     return { data: { dropped: stashRef }, gitLog: res };
   });
 }
@@ -1096,7 +1108,7 @@ export async function getLog(repoPath, { limit = 30, skip = 0, query = '' } = {}
   }
 
   const res = await runGit(repoPath, args);
-  if (!res.ok) throw new Error(res.stderr || '获取提交历史失败');
+  if (!res.ok) throw createGitError(res.stderr || '获取提交历史失败', res);
 
   const all = res.stdout
     .split('\x1e')
@@ -1126,7 +1138,7 @@ export async function getLog(repoPath, { limit = 30, skip = 0, query = '' } = {}
 export async function getCommitDetail(repoPath, { hash } = {}) {
   const safeHash = assertSafeCommitHash(hash);
   const res = await runGit(repoPath, ['show', '--stat', '--patch', '--no-color', safeHash]);
-  if (!res.ok) throw new Error(res.stderr || '获取提交详情失败');
+  if (!res.ok) throw createGitError(res.stderr || '获取提交详情失败', res);
   const { text, truncated } = truncateText(res.stdout);
   return {
     data: { hash: safeHash, detail: text, truncated },
@@ -1138,10 +1150,10 @@ export async function resetSoftLast(repoPath) {
   return withRepoLock(repoPath, async () => {
     const parentCheck = await runGit(repoPath, ['rev-parse', '--verify', 'HEAD~1']);
     if (!parentCheck.ok) {
-      throw new Error('当前提交没有父提交，无法执行 reset --soft HEAD~1');
+      throw createGitError('当前提交没有父提交，无法执行 reset --soft HEAD~1', parentCheck);
     }
     const res = await runGit(repoPath, ['reset', '--soft', 'HEAD~1']);
-    if (!res.ok) throw new Error(res.stderr || '撤销最新提交失败');
+    if (!res.ok) throw createGitError(res.stderr || '撤销最新提交失败', res);
     return { data: { resetSoft: true }, gitLog: res };
   });
 }
@@ -1150,7 +1162,7 @@ export async function revertCommit(repoPath, { hash } = {}) {
   const safeHash = assertSafeCommitHash(hash);
   return withRepoLock(repoPath, async () => {
     const res = await runGit(repoPath, ['revert', '--no-edit', safeHash]);
-    if (!res.ok) throw new Error(res.stderr || res.stdout || `Revert 提交 ${safeHash} 失败`);
+    if (!res.ok) throw createGitError(res.stderr || res.stdout || `Revert 提交 ${safeHash} 失败`, res);
     return { data: { reverted: safeHash }, gitLog: res };
   });
 }
@@ -1161,7 +1173,7 @@ export async function initRepo(dirPath) {
   }
   return withRepoLock(dirPath, async () => {
     const res = await runGit(dirPath, ['init']);
-    if (!res.ok) throw new Error(res.stderr || '初始化 Git 仓库失败');
+    if (!res.ok) throw createGitError(res.stderr || '初始化 Git 仓库失败', res);
     return { data: { initialized: true, repoPath: safeRealpath(dirPath) }, gitLog: res };
   });
 }
@@ -1305,7 +1317,7 @@ export async function discardAllUnstaged(repoPath) {
         for (const item of st.unstaged) {
           const single = await runGit(repoPath, ['restore', '--worktree', '--', item.path]);
           logs.push(single);
-          if (!single.ok) throw new Error(single.stderr || res.stderr || '批量还原工作区修改失败');
+          if (!single.ok) throw createGitError(single.stderr || res.stderr || '批量还原工作区修改失败', logs);
         }
       }
       discardedCount += st.unstaged.length;
@@ -1357,7 +1369,7 @@ async function runOperationAction(repoPath, action) {
     const res = await runGit(repoPath, args, { env: { GIT_EDITOR: 'true' } });
     if (!res.ok) {
       const errText = [res.stderr, res.stdout].filter(Boolean).join('\n').trim();
-      throw new Error(errText || `执行 ${args.join(' ')} 失败`);
+      throw createGitError(errText || `执行 ${args.join(' ')} 失败`, res);
     }
     return { data: { operationState: opState, action, output: res.stdout.trim() }, gitLog: res };
   });
@@ -1382,13 +1394,13 @@ export async function resolveConflict(repoPath, { path: relPath, strategy = 'mar
       const coRes = await runGit(repoPath, ['checkout', `--${strategy}`, '--', safePath]);
       logs.push(coRes);
       if (!coRes.ok) {
-        throw new Error(coRes.stderr || coRes.stdout || `采用 ${strategy} 失败`);
+        throw createGitError(coRes.stderr || coRes.stdout || `采用 ${strategy} 失败`, logs);
       }
     }
     const addRes = await runGit(repoPath, ['add', '--', safePath]);
     logs.push(addRes);
     if (!addRes.ok) {
-      throw new Error(addRes.stderr || '标记冲突已解决失败');
+      throw createGitError(addRes.stderr || '标记冲突已解决失败', logs);
     }
     return { data: { resolved: safePath, strategy }, gitLog: addRes, logs };
   });
@@ -1404,7 +1416,7 @@ export async function getStashDetail(repoPath, { ref } = {}) {
     res = await runGit(repoPath, ['stash', 'show', '--stat', '--patch', '--no-color', stashRef]);
   }
   if (!res.ok) {
-    throw new Error(res.stderr || `获取 ${stashRef} 详情失败`);
+    throw createGitError(res.stderr || `获取 ${stashRef} 详情失败`, res);
   }
   const { text, truncated } = truncateText(res.stdout);
   return {

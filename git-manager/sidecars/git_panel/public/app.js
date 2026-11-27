@@ -1,10 +1,12 @@
 /**
  * Antigravity 原生 Git 管理侧边面板前端脚本。
  */
+import { formatErrorMessage, formatLogEntry, normalizeLang } from './message_formatter.mjs';
+
 (() => {
   'use strict';
 
-  const EXPECTED_SERVER_VERSION = '1.2.0';
+  const EXPECTED_SERVER_VERSION = '1.3.0';
   const SETTINGS_STORAGE_KEY = 'agy_git_manager_settings_v1';
   const AUTO_FETCH_INTERVAL_MS = 90_000;
   const HISTORY_PAGE_SIZE = 30;
@@ -57,6 +59,10 @@
 
   const $ = (id) => document.getElementById(id);
 
+  function getCurrentLang() {
+    return normalizeLang(state.settings.commitLang);
+  }
+
   function getConversationId() {
     if (window.sidecar?.conversationId) return window.sidecar.conversationId;
     try {
@@ -73,22 +79,31 @@
   }
 
   function reportFatalError(title, detail) {
+    const lang = getCurrentLang();
+    const formatted = formatErrorMessage(detail || '', { lang, command: 'frontend-runtime' });
+    const displayTitle = lang === 'en' && title === '面板脚本运行异常'
+      ? 'Panel Runtime Error'
+      : (lang === 'en' && title === '面板异步请求异常' ? 'Panel Async Request Error' : title);
+
     const emptyState = $('empty-state');
     const workspaceMain = $('workspace-main');
     if (emptyState && workspaceMain) {
       workspaceMain.classList.add('hidden');
       emptyState.classList.remove('hidden');
-      $('empty-title').textContent = title;
-      $('empty-desc').textContent = detail;
+      $('empty-title').textContent = displayTitle;
+      $('empty-desc').textContent = formatted.summary;
       $('empty-actions').classList.add('hidden');
     }
     state.hasUnreadError = true;
     state.logs.unshift({
       time: new Date().toLocaleTimeString(),
       command: 'frontend-runtime',
+      route: '',
       ok: false,
       durationMs: 0,
-      output: `${title}: ${detail}`,
+      stdout: '',
+      stderr: '',
+      error: `${displayTitle}: ${detail}`,
     });
     if (state.logs.length > 30) state.logs.length = 30;
     renderLogs();
@@ -121,9 +136,10 @@
     el.className = `toast ${type}`;
     el.textContent = message;
     container.appendChild(el);
+    const duration = type === 'error' ? 5200 : 3600;
     setTimeout(() => {
       el.remove();
-    }, 3600);
+    }, duration);
   }
 
   function readLocalSettings() {
@@ -156,6 +172,7 @@
     $('commit-lang-pill').textContent = commitLang === 'en' ? 'AI: EN' : 'AI: 中文';
     syncDefaultStageAllCheckbox(state.status);
     updateCommitButtonsUI();
+    renderLogs();
   }
 
   async function loadSettings() {
@@ -239,7 +256,7 @@
     }
   }
 
-  function appendGitLogs(logs) {
+  function appendGitLogs(logs, route = '') {
     if (!Array.isArray(logs) || logs.length === 0) return;
     for (const item of logs) {
       if (!item || !item.command) continue;
@@ -247,9 +264,12 @@
       state.logs.unshift({
         time: new Date().toLocaleTimeString(),
         command: item.command,
+        route,
         ok: Boolean(item.ok),
         durationMs: item.durationMs ?? 0,
-        output: [item.stderr, item.stdout].filter(Boolean).join('\n').trim(),
+        stdout: item.stdout || '',
+        stderr: item.stderr || '',
+        error: '',
       });
     }
     if (state.logs.length > 30) {
@@ -259,6 +279,7 @@
   }
 
   function renderLogs() {
+    const lang = getCurrentLang();
     $('log-count').textContent = String(state.logs.length);
     const dot = $('log-error-dot');
     if (dot) {
@@ -267,12 +288,13 @@
 
     const latest = state.logs[0];
     $('log-last-summary').textContent = latest
-      ? `${latest.ok ? '✓' : '✗'} ${latest.command} (${latest.durationMs}ms)`
-      : '就绪';
+      ? formatLogEntry(latest, lang).lastSummaryText
+      : (lang === 'en' ? 'Ready' : '就绪');
 
     const container = $('log-entries');
     container.innerHTML = '';
     for (const entry of state.logs) {
+      const formatted = formatLogEntry(entry, lang);
       const div = document.createElement('div');
       div.className = `log-item ${entry.ok ? '' : 'err'}`;
 
@@ -281,26 +303,30 @@
 
       const cmd = document.createElement('span');
       cmd.className = 'log-cmd';
-      cmd.textContent = `[${entry.time}] ${entry.ok ? '✓' : '✗'} ${entry.command} (${entry.durationMs}ms)`;
+      cmd.textContent = formatted.headText;
       head.appendChild(cmd);
 
       if (!entry.ok) {
         const fixBtn = document.createElement('button');
         fixBtn.className = 'link-btn';
-        fixBtn.textContent = '交给 Agent 排查';
+        fixBtn.textContent = formatted.troubleshootLabel;
+        const rawOut = [entry.stderr, entry.stdout, entry.error, entry.output]
+          .filter(Boolean)
+          .join('\n')
+          .trim();
         fixBtn.onclick = () => {
           sendToAgent(
-            `我在仓库 \`${state.activeRepo}\` 执行以下命令失败：\n\`\`\`\n${entry.command}\n\`\`\`\n报错输出：\n\`\`\`\n${entry.output || '未知错误'}\n\`\`\`\n请帮我诊断原因并给出修复方案（如有安全修复步骤请协助处理）。`,
+            `我在仓库 \`${state.activeRepo}\` 执行以下命令失败：\n\`\`\`\n${entry.command || entry.route}\n\`\`\`\n报错输出：\n\`\`\`\n${rawOut || '未知错误'}\n\`\`\`\n请帮我诊断原因并给出修复方案（如有安全修复步骤请协助处理）。`,
           );
         };
         head.appendChild(fixBtn);
       }
 
       div.appendChild(head);
-      if (entry.output) {
+      if (formatted.bodyText) {
         const pre = document.createElement('pre');
         pre.className = 'log-output';
-        pre.textContent = entry.output.slice(0, 600);
+        pre.textContent = formatted.bodyText;
         div.appendChild(pre);
       }
       container.appendChild(div);
@@ -315,26 +341,43 @@
       ...payload,
     };
     const res = await sidecarFetch(route, fullPayload);
-    if (recordLog || !res.ok) {
-      if (res.logs && res.logs.length > 0) appendGitLogs(res.logs);
-      else if (res.gitLog) appendGitLogs([res.gitLog]);
+    const resLogs = Array.isArray(res.logs) && res.logs.length > 0
+      ? res.logs
+      : (res.gitLog ? [res.gitLog] : []);
+
+    if ((recordLog || !res.ok) && resLogs.length > 0) {
+      appendGitLogs(resLogs, route);
     }
 
     if (!res.ok) {
+      const lang = getCurrentLang();
+      const failedLog = [...resLogs].reverse().find((l) => l && !l.ok) || resLogs[resLogs.length - 1];
+      const failedCmd = failedLog?.command || '';
+      const rawError = res.error || '';
+      const formatted = formatErrorMessage(rawError, { lang, command: failedCmd, route });
+
       if (!silent) {
         state.hasUnreadError = true;
-        showToast(res.error || '操作失败', 'error');
-        state.logs.unshift({
-          time: new Date().toLocaleTimeString(),
-          command: route,
-          ok: false,
-          durationMs: 0,
-          output: res.error || '操作失败',
-        });
-        if (state.logs.length > 30) state.logs.length = 30;
+        showToast(formatted.summary, 'error');
+        const hasFailedGitLog = resLogs.some((l) => l && !l.ok);
+        if (!hasFailedGitLog) {
+          state.logs.unshift({
+            time: new Date().toLocaleTimeString(),
+            command: '',
+            route,
+            ok: false,
+            durationMs: 0,
+            stdout: '',
+            stderr: '',
+            error: rawError || formatted.summary,
+          });
+          if (state.logs.length > 30) state.logs.length = 30;
+        }
         renderLogs();
       }
-      throw new Error(res.error || '操作失败');
+      const err = new Error(formatted.summary);
+      err.rawMessage = rawError;
+      throw err;
     }
     return res.data;
   }
@@ -377,7 +420,10 @@
         showToast('已委托给当前 Antigravity 对话中的 Agent', 'success');
         return;
       } catch (err) {
-        showToast(`发送给 Agent 失败：${err.message}`, 'error');
+        const msg = getCurrentLang() === 'en'
+          ? `Failed to send to Agent: ${err.message}`
+          : `发送给 Agent 失败：${err.message}`;
+        showToast(msg, 'error');
       }
     }
 
@@ -1061,8 +1107,8 @@
               await refreshBranches();
               showToast(`已删除分支 ${b.name}`, 'success');
             } catch (err) {
-              const msg = err?.message || '';
-              if (/not fully merged|未完全合并/i.test(msg)) {
+              const rawMsg = err?.rawMessage || err?.message || '';
+              if (/not fully merged|未完全合并|尚未完全 Merge/i.test(rawMsg)) {
                 const forceOk = await showConfirmModal({
                   title: '分支尚未合并，是否强制删除？',
                   body: `分支 "${b.name}" 包含尚未合并到当前分支的提交。确定要使用 git branch -D 强制删除吗？此操作可能导致孤立提交丢失。`,
@@ -1074,7 +1120,8 @@
                 await refreshBranches();
                 showToast(`已强制删除分支 ${b.name}`, 'success');
               } else {
-                showToast(msg || '删除分支失败', 'error');
+                const fallback = getCurrentLang() === 'en' ? 'Failed to delete Branch' : '删除 Branch 失败';
+                showToast(err?.message || fallback, 'error');
               }
             }
           });
@@ -1538,8 +1585,13 @@
       conversationId: convId,
     });
     if (!res.ok) {
-      showToast(res.error || '扫描仓库失败', 'error');
-      reportFatalError('扫描 Git 仓库失败', res.error || '未知错误');
+      const lang = getCurrentLang();
+      const formatted = formatErrorMessage(res.error || '', { lang, route: '/api/repos' });
+      showToast(formatted.summary, 'error');
+      reportFatalError(
+        lang === 'en' ? 'Failed to scan Git repositories' : '扫描 Git 仓库失败',
+        res.error || (lang === 'en' ? 'Unknown error' : '未知错误'),
+      );
       return;
     }
 
@@ -1650,14 +1702,24 @@
       btn.onclick = () => {
         const lang = btn.dataset.lang === 'en' ? 'en' : 'zh';
         saveSettings({ commitLang: lang });
-        showToast(lang === 'en' ? 'AI 提交说明语言已切换为英文' : 'AI 提交说明语言已切换为中文', 'success');
+        showToast(
+          lang === 'en'
+            ? 'Language switched to English (AI commit, alerts & activity log)'
+            : '语言已切换为中文（AI 说明、报警提示与活动日志）',
+          'success',
+        );
       };
     });
 
     $('commit-lang-pill').onclick = () => {
       const next = state.settings.commitLang === 'en' ? 'zh' : 'en';
       saveSettings({ commitLang: next });
-      showToast(next === 'en' ? 'AI 提交说明语言：English' : 'AI 提交说明语言：中文', 'info');
+      showToast(
+        next === 'en'
+          ? 'Language: English (AI commit, alerts & activity log)'
+          : '语言：中文（AI 说明、报警提示与活动日志）',
+        'info',
+      );
     };
 
     $('opt-default-stage-all').onchange = (e) => saveSettings({ defaultStageAll: e.target.checked });
@@ -1955,7 +2017,12 @@
 
     $('btn-create-branch').onclick = () => {
       const name = $('new-branch-name').value.trim();
-      if (!name) return showToast('请输入新分支名称', 'error');
+      if (!name) {
+        return showToast(
+          getCurrentLang() === 'en' ? 'Please enter a new Branch name' : '请输入新 Branch 名称',
+          'error',
+        );
+      }
       runBusy(async () => {
         await apiCall('/api/branch/create', { name, checkout: true });
         $('new-branch-name').value = '';
