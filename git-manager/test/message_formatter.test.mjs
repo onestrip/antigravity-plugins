@@ -1,19 +1,29 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
+import vm from 'node:vm';
 
 import { commit, deleteBranch } from '../sidecars/git_panel/git_service.mjs';
-import {
+
+await import('../sidecars/git_panel/public/app.js');
+const {
   formatErrorMessage,
   formatLogEntry,
   getActionLabel,
   normalizeLang,
-} from '../sidecars/git_panel/public/message_formatter.mjs';
+} = globalThis.__GIT_MANAGER_FORMATTER__;
 
 describe('message_formatter unit tests', () => {
+  it('parses app.js cleanly as a classic non-module script', () => {
+    const source = readFileSync(
+      new URL('../sidecars/git_panel/public/app.js', import.meta.url),
+      'utf8',
+    );
+    assert.doesNotThrow(() => new vm.Script(source));
+  });
   it('normalizes language with zh as default', () => {
     assert.equal(normalizeLang('zh'), 'zh');
     assert.equal(normalizeLang('en'), 'en');

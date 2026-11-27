@@ -346,7 +346,6 @@ const app = new SidecarApp();
 app.page('/', serveStatic('index.html', 'text/html; charset=utf-8'));
 app.page('/styles.css', serveStatic('styles.css', 'text/css; charset=utf-8'));
 app.page('/app.js', serveStatic('app.js', 'application/javascript; charset=utf-8'));
-app.page('/message_formatter.mjs', serveStatic('message_formatter.mjs', 'application/javascript; charset=utf-8'));
 
 // 设置持久化接口
 app.api('/api/settings/get', async () => {
